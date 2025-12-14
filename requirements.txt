@@ -1,0 +1,37 @@
+# Socket.IO
+python-socketio[asyncio]==5.11.0
+
+# Web Framework
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+
+# Utilitários
+pydantic==2.5.3
+python-dotenv==1.0.0
+
+# Logging
+structlog==24.1.0
+
+# ML/NLP
+torch==2.1.2
+transformers==4.37.2
+sentencepiece==0.1.99
+tokenizers==0.15.0
+
+# SBERT para análise semântica
+sentence-transformers>=2.3.0
+
+# NLP em Português
+nltk==3.8.1
+
+# Cache
+cachetools==5.3.2
+
+# HTTP Client (para health checks)
+httpx==0.26.0
+
+# Transcrição de áudio (Whisper)
+openai-whisper==20231117
+ffmpeg-python==0.2.0
+scipy==1.11.4
+

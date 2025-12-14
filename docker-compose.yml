@@ -1,0 +1,41 @@
+version: '3.8'
+
+services:
+  text-analysis:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: live-meeting-text-analysis
+    restart: unless-stopped
+    ports:
+      - "8001:8000"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - LOG_LEVEL=INFO
+      - LOG_FORMAT=console
+      - SOCKETIO_CORS_ORIGINS=*
+      - PORT=8000
+      - HOST=0.0.0.0
+      - MODEL_CACHE_DIR=/app/models/.cache
+      - MODEL_DEVICE=cpu
+      - WHISPER_MODEL_NAME=tiny
+      - WHISPER_DEVICE=cpu
+      - WHISPER_LANGUAGE=pt
+      - SENTIMENT_MODEL=neuralmind/bert-base-portuguese-cased
+      - EMOTION_MODEL=cardiffnlp/twitter-roberta-base-emotion
+      - ENABLE_ML_ANALYSIS=true
+      - ANALYSIS_BATCH_SIZE=1
+      - ANALYSIS_MAX_LENGTH=512
+    volumes:
+      - ./src:/app/src:ro
+      - text_analysis_models:/app/models
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  text_analysis_models:
+
