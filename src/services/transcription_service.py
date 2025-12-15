@@ -51,7 +51,8 @@ class TranscriptionService:
             env_var_WHISPER_MODEL_NAME=env_value,
             config_WHISPER_MODEL_NAME=self.model_name,
             device=self.device,
-            language=self.language
+            language=self.language,
+            note="Se model=base aparecer nos logs, verifique WHISPER_MODEL_NAME no Railway e reinicie o serviço"
         )
         
         # Semáforo para limitar transcrições simultâneas
@@ -135,7 +136,8 @@ class TranscriptionService:
                 model=self.model_name,
                 device=device,
                 language=self.language,
-                load_time_ms=round(load_latency_ms, 2)
+                load_time_ms=round(load_latency_ms, 2),
+                warning="Se model=base, configure WHISPER_MODEL_NAME=tiny no Railway e reinicie"
             )
             
         except Exception as e:
