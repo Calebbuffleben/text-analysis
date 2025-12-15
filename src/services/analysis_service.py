@@ -6,7 +6,9 @@ Orquestra análise com BERT, gerencia cache e agrega resultados.
 from typing import Dict, Any, Tuple, List
 from ..types.messages import TranscriptionChunk
 from ..models.bert_analyzer import BERTAnalyzer
+from ..models.conversation_context import ConversationContext
 from ..services.cache_service import AnalysisCache
+from ..metrics.semantic_metrics import SemanticMetrics
 from ..config import Config
 import structlog
 import time
@@ -22,21 +24,52 @@ class TextAnalysisService:
     - Gerenciar cache de resultados
     - Lazy loading do analisador BERT
     - Orquestrar análise (sentimento, keywords, emoções)
+    - Classificação de categorias de vendas usando SBERT
     - Agregar resultados
+    
+    A classificação de categorias de vendas identifica o estágio da conversa
+    usando análise semântica com SBERT. As categorias incluem: price_interest,
+    value_exploration, objection_soft, objection_hard, decision_signal,
+    information_gathering, stalling, closing_readiness.
+    
+    O serviço também mantém contexto conversacional para análise temporal,
+    permitindo agregação de categorias, detecção de transições e cálculo
+    de tendências semânticas ao longo da conversa.
     """
     
-    def __init__(self):
-        """Inicializa serviço de análise"""
+    def __init__(self, context_window_size: int = 10, context_window_duration_ms: int = 60000):
+        """
+        Inicializa serviço de análise.
+        
+        Args:
+        =====
+        context_window_size: int, opcional (padrão: 10)
+            Número máximo de chunks a manter na janela de contexto
+        
+        context_window_duration_ms: int, opcional (padrão: 60000)
+            Duração da janela de contexto em milissegundos (padrão: 60 segundos)
+        """
         self.analyzer = None
         self.cache = AnalysisCache(
             ttl_seconds=Config.CACHE_TTL_SECONDS,
             max_size=Config.CACHE_MAX_SIZE
         )
         
+        # Contexto conversacional por participante/reunião
+        # Chave: "meetingId:participantId"
+        self.conversation_contexts: Dict[str, ConversationContext] = {}
+        self.context_window_size = context_window_size
+        self.context_window_duration_ms = context_window_duration_ms
+        
+        # Coletor de métricas semânticas
+        self.metrics = SemanticMetrics(alpha=0.1)
+        
         logger.info(
             "✅ [SERVIÇO] TextAnalysisService inicializado",
             cache_ttl=Config.CACHE_TTL_SECONDS,
-            cache_max_size=Config.CACHE_MAX_SIZE
+            cache_max_size=Config.CACHE_MAX_SIZE,
+            context_window_size=context_window_size,
+            context_window_duration_ms=context_window_duration_ms
         )
     
     def _get_analyzer(self) -> BERTAnalyzer:
@@ -57,6 +90,24 @@ class TextAnalysisService:
             )
         return self.analyzer
     
+    def _get_context_key(self, chunk: TranscriptionChunk) -> str:
+        """
+        Gera chave única para contexto conversacional.
+        
+        A chave combina meetingId e participantId para manter contexto
+        separado por participante em cada reunião.
+        
+        Args:
+        =====
+        chunk: TranscriptionChunk
+            Chunk de transcrição
+        
+        Returns:
+        ========
+        str: Chave no formato "meetingId:participantId"
+        """
+        return f"{chunk.meetingId}:{chunk.participantId}"
+    
     async def analyze(self, chunk: TranscriptionChunk) -> Dict[str, Any]:
         """
         Analisa texto e retorna resultados completos.
@@ -73,14 +124,20 @@ class TextAnalysisService:
         Returns:
             Dict com resultados da análise:
             {
-                'word_count': int,
-                'char_count': int,
-                'has_question': bool,
-                'has_exclamation': bool,
-                'sentiment_score': Dict[str, float],
-                'emotions': Dict[str, float],
-                'topics': List[str],
-                'keywords': List[str]
+                'intent': str,
+                'intent_confidence': float,
+                'topic': str,
+                'topic_confidence': float,
+                'speech_act': str,
+                'speech_act_confidence': float,
+                'keywords': List[str],
+                'entities': List[str],
+                'sentiment': str,
+                'sentiment_score': float,
+                'urgency': float,
+                'embedding': List[float],
+                'sales_category': Optional[str],  # Categoria de vendas detectada (ex: 'price_interest')
+                'sales_category_confidence': Optional[float]  # Confiança da classificação (0.0 a 1.0)
             }
         """
         start_time = time.perf_counter()
@@ -262,6 +319,256 @@ class TextAnalysisService:
             )
             embedding = []
         
+        # ========================================================================
+        # CLASSIFICAÇÃO DE CATEGORIAS DE VENDAS COM SBERT
+        # ========================================================================
+        # 
+        # Classifica o texto em uma das 8 categorias de vendas usando análise
+        # semântica com SBERT. Esta classificação é útil para identificar o estágio
+        # da conversa de vendas e fornecer feedback contextualizado.
+        #
+        # Categorias possíveis:
+        # - price_interest: Cliente demonstra interesse em saber o preço
+        # - value_exploration: Cliente explora o valor e benefícios da solução
+        # - objection_soft: Objeções leves, dúvidas ou hesitações
+        # - objection_hard: Objeções fortes e definitivas, rejeição clara
+        # - decision_signal: Sinais claros de que o cliente está pronto para decidir
+        # - information_gathering: Cliente busca informações adicionais
+        # - stalling: Cliente está protelando ou adiando a decisão
+        # - closing_readiness: Cliente demonstra prontidão para fechar o negócio
+        #
+        # A classificação usa exemplos de referência pré-definidos e compara
+        # semanticamente o texto com esses exemplos usando embeddings SBERT.
+        #
+        # Tratamento de erros:
+        # - Se SBERT não estiver configurado, sales_category será None
+        # - Se a classificação falhar, continua sem ela (não bloqueia outras análises)
+        # - Se nenhuma categoria atingir o threshold mínimo, retorna None
+        # ========================================================================
+        sales_category = None
+        sales_category_confidence = None
+        try:
+            if Config.SBERT_MODEL_NAME:
+                logger.debug(
+                    "💼 [ANÁLISE] Classificando categoria de vendas com SBERT",
+                    meeting_id=chunk.meetingId,
+                    text_preview=chunk.text[:50]
+                )
+                
+                # Classificar texto em categoria de vendas
+                # O método classify_sales_category() retorna:
+                # - categoria: str ou None (nome da categoria detectada)
+                # - confiança: float (0.0 a 1.0, score de confiança)
+                # - scores: Dict[str, float] (scores de todas as categorias, útil para debugging)
+                # - ambiguidade: float (0.0 a 1.0, quão ambíguo é o texto)
+                # - intensidade: float (0.0 a 1.0, score absoluto da melhor categoria)
+                # - flags: Dict[str, bool] (flags semânticas booleanas)
+                categoria, confianca, scores, ambiguidade, intensidade, flags = analyzer.classify_sales_category(
+                    chunk.text,
+                    min_confidence=0.3  # Threshold mínimo de confiança (30%)
+                )
+                
+                # Armazenar resultados
+                sales_category = categoria
+                sales_category_confidence = confianca
+                sales_category_ambiguity = ambiguidade
+                sales_category_intensity = intensidade
+                sales_category_flags = flags
+                
+                if sales_category:
+                    # Construir reasoning detalhado para logs explicáveis
+                    reasoning = {
+                        "why": f"High confidence {sales_category} classification",
+                        "confidence_reason": f"Large gap between best ({round(scores.get(sales_category, 0.0), 2)}) and second best category",
+                        "intensity_reason": f"Absolute score of {round(intensidade, 2)}",
+                        "ambiguity_reason": f"Low ambiguity ({round(ambiguidade, 2)})" if ambiguidade < 0.3 else f"Moderate ambiguity ({round(ambiguidade, 2)})"
+                    }
+                    
+                    # Adicionar flags ativas ao reasoning
+                    active_flags = [flag for flag, value in flags.items() if value]
+                    if active_flags:
+                        reasoning["active_flags"] = active_flags
+                        reasoning["flags_reason"] = f"Semantic flags triggered: {', '.join(active_flags)}"
+                    
+                    logger.info(
+                        "✅ [ANÁLISE] Categoria de vendas classificada",
+                        meeting_id=chunk.meetingId,
+                        participant_id=chunk.participantId,
+                        sales_category=sales_category,
+                        sales_category_confidence=round(confianca, 4),
+                        sales_category_intensity=round(intensidade, 4),
+                        sales_category_ambiguity=round(ambiguidade, 4),
+                        sales_category_flags=flags,
+                        best_score=round(scores.get(sales_category, 0.0), 4) if scores else 0.0,
+                        reasoning=reasoning
+                    )
+                else:
+                    # Construir reasoning para caso sem categoria detectada
+                    best_score = max(scores.values()) if scores else 0.0
+                    reasoning = {
+                        "why": "No category met minimum confidence threshold",
+                        "reason": f"Best score {round(best_score, 2)} < {0.3}",
+                        "ambiguity_reason": f"Ambiguity: {round(ambiguidade, 2)}" if ambiguidade else "N/A"
+                    }
+                    
+                    logger.debug(
+                        "⚠️ [ANÁLISE] Nenhuma categoria de vendas detectada com confiança suficiente",
+                        meeting_id=chunk.meetingId,
+                        best_score=round(best_score, 4),
+                        ambiguity=round(ambiguidade, 4) if ambiguidade else None,
+                        intensity=round(intensidade, 4) if intensidade else None,
+                        min_confidence=0.3,
+                        reasoning=reasoning
+                    )
+        except Exception as e:
+            # Se a classificação de categoria de vendas falhar, continuar sem ela
+            # Isso não deve bloquear outras análises
+            logger.warn(
+                "⚠️ [ANÁLISE] Falha ao classificar categoria de vendas, continuando sem ela",
+                error=str(e),
+                error_type=type(e).__name__,
+                meeting_id=chunk.meetingId
+            )
+            sales_category = None
+            sales_category_confidence = None
+            sales_category_ambiguity = None
+            sales_category_intensity = None
+            sales_category_flags = {}
+        
+        # ========================================================================
+        # CONTEXTO CONVERSACIONAL
+        # ========================================================================
+        # Adicionar chunk ao contexto conversacional para análise temporal
+        # O contexto permite análise de padrões ao longo da conversa, como:
+        # - Agregação temporal de categorias
+        # - Detecção de transições de estágio
+        # - Cálculo de tendências semânticas
+        # - Redução de ruído de frases isoladas
+        # ========================================================================
+        context_key = self._get_context_key(chunk)
+        if context_key not in self.conversation_contexts:
+            self.conversation_contexts[context_key] = ConversationContext(
+                window_size=self.context_window_size,
+                window_duration_ms=self.context_window_duration_ms
+            )
+        
+        context = self.conversation_contexts[context_key]
+        context.add_chunk({
+            'text': chunk.text,
+            'sales_category': sales_category,
+            'sales_category_confidence': sales_category_confidence,
+            'sales_category_intensity': sales_category_intensity,
+            'sales_category_ambiguity': sales_category_ambiguity,
+            'timestamp': chunk.timestamp,
+            'embedding': embedding
+        })
+        
+        # Obter janela de contexto para análise temporal
+        window = context.get_window(chunk.timestamp)
+        
+        # ========================================================================
+        # ANÁLISE CONTEXTUAL: Agregação, Transições e Tendências
+        # ========================================================================
+        # 
+        # Usa contexto histórico para análises mais robustas:
+        # - Agregação temporal: reduz ruído de frases isoladas
+        # - Detecção de transições: identifica mudanças de estágio
+        # - Tendência semântica: indica direção da conversa
+        # ========================================================================
+        sales_category_aggregated = None
+        sales_category_transition = None
+        sales_category_trend = None
+        
+        try:
+            if window and Config.SBERT_MODEL_NAME:
+                analyzer = self._get_analyzer()
+                
+                # 1. Agregar categorias temporais para reduzir ruído
+                sales_category_aggregated = analyzer.aggregate_categories_temporal(window)
+                
+                if sales_category_aggregated:
+                    logger.debug(
+                        "📊 [CONTEXTO] Categorias agregadas temporalmente",
+                        meeting_id=chunk.meetingId,
+                        participant_id=chunk.participantId,
+                        dominant_category=sales_category_aggregated['dominant_category'],
+                        stability=round(sales_category_aggregated['stability'], 4),
+                        distribution=sales_category_aggregated['category_distribution']
+                    )
+                
+                # 2. Detectar transições de categoria
+                if sales_category and sales_category_confidence is not None:
+                    sales_category_transition = analyzer.detect_category_transition(
+                        sales_category,
+                        sales_category_confidence,
+                        window
+                    )
+                    
+                    if sales_category_transition:
+                        logger.info(
+                            "🔄 [CONTEXTO] Transição de categoria detectada",
+                            meeting_id=chunk.meetingId,
+                            participant_id=chunk.participantId,
+                            transition_type=sales_category_transition['transition_type'],
+                            from_category=sales_category_transition['from_category'],
+                            to_category=sales_category_transition['to_category'],
+                            confidence=round(sales_category_transition['confidence'], 4),
+                            time_delta_ms=sales_category_transition['time_delta_ms']
+                        )
+                
+                # 3. Calcular tendência semântica
+                sales_category_trend = analyzer.calculate_semantic_trend(window)
+                
+                if sales_category_trend:
+                    logger.debug(
+                        "📈 [CONTEXTO] Tendência semântica calculada",
+                        meeting_id=chunk.meetingId,
+                        participant_id=chunk.participantId,
+                        trend=sales_category_trend['trend'],
+                        trend_strength=round(sales_category_trend['trend_strength'], 4),
+                        current_stage=sales_category_trend['current_stage'],
+                        velocity=round(sales_category_trend['velocity'], 4)
+                    )
+        except Exception as e:
+            logger.warn(
+                "⚠️ [CONTEXTO] Falha ao realizar análises contextuais",
+                error=str(e),
+                error_type=type(e).__name__,
+                meeting_id=chunk.meetingId
+            )
+        
+        logger.debug(
+            "📊 [CONTEXTO] Chunk adicionado ao contexto conversacional",
+            meeting_id=chunk.meetingId,
+            participant_id=chunk.participantId,
+            context_key=context_key,
+            window_size=len(window),
+            history_size=context.get_history_size()
+        )
+        
+        # ========================================================================
+        # REGISTRO DE MÉTRICAS SEMÂNTICAS
+        # ========================================================================
+        # Registra métricas de qualidade para monitoramento e ajustes contínuos
+        # ========================================================================
+        try:
+            self.metrics.record_classification(
+                category=sales_category,
+                confidence=sales_category_confidence or 0.0,
+                intensity=sales_category_intensity or 0.0,
+                ambiguity=sales_category_ambiguity or 1.0,
+                flags=sales_category_flags,
+                transition=sales_category_transition
+            )
+        except Exception as e:
+            # Não bloquear análise se registro de métricas falhar
+            logger.warn(
+                "⚠️ [MÉTRICAS] Falha ao registrar métricas",
+                error=str(e),
+                error_type=type(e).__name__,
+                meeting_id=chunk.meetingId
+            )
+        
         # Construir resultado completo com nova estrutura
         result = {
             'intent': intent,
@@ -275,7 +582,17 @@ class TextAnalysisService:
             'sentiment': sentiment_label,
             'sentiment_score': sentiment_single_score,
             'urgency': urgency,
-            'embedding': embedding
+            'embedding': embedding,
+            # Categorias de vendas classificadas com SBERT
+            'sales_category': sales_category,
+            'sales_category_confidence': sales_category_confidence,
+            'sales_category_intensity': sales_category_intensity,
+            'sales_category_ambiguity': sales_category_ambiguity,
+            'sales_category_flags': sales_category_flags,
+            # Análises contextuais (baseadas em histórico)
+            'sales_category_aggregated': sales_category_aggregated,
+            'sales_category_transition': sales_category_transition,
+            'sales_category_trend': sales_category_trend
         }
         
         # Armazenar no cache
@@ -311,6 +628,11 @@ class TextAnalysisService:
             keywords_count=len(keywords),
             entities_count=len(entities),
             embedding_dim=len(embedding),
+            sales_category=sales_category,
+            sales_category_confidence=round(sales_category_confidence, 4) if sales_category_confidence is not None else None,
+            sales_category_intensity=round(sales_category_intensity, 4) if sales_category_intensity is not None else None,
+            sales_category_ambiguity=round(sales_category_ambiguity, 4) if sales_category_ambiguity is not None else None,
+            sales_category_flags=sales_category_flags if sales_category_flags else None,
             latency_ms=round(latency_ms, 2)
         )
         

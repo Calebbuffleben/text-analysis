@@ -5,6 +5,7 @@ Integra FastAPI (para endpoints REST) com Socket.IO (para comunicação real-tim
 
 import uvicorn
 import structlog
+import time
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from .config import Config
@@ -181,6 +182,37 @@ async def cache_stats():
     """
     stats = analysis_service.cache.stats()
     return JSONResponse(stats)
+
+
+@fastapi_app.get("/metrics")
+async def get_metrics():
+    """
+    Endpoint para métricas semânticas de qualidade.
+    
+    Retorna métricas agregadas sobre a classificação de categorias de vendas,
+    incluindo:
+    - Taxa de sucesso de classificações
+    - Confiança, intensidade e ambiguidade médias
+    - Distribuição de categorias detectadas
+    - Taxa de alta confiança
+    - Contagem de flags e transições
+    
+    Returns:
+        JSON com métricas semânticas
+    """
+    try:
+        metrics = analysis_service.metrics.get_metrics()
+        summary = analysis_service.metrics.get_summary()
+        
+        return JSONResponse({
+            "status": "ok",
+            "metrics": metrics,
+            "summary": summary,
+            "timestamp": time.time()
+        })
+    except Exception as e:
+        logger.error("Error in /metrics endpoint", error=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @fastapi_app.post("/cache/clear")

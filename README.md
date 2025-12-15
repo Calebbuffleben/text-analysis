@@ -2,6 +2,19 @@
 
 Serviço Python para análise de transcrições em tempo real.
 
+## Funcionalidades
+
+- ✅ **Análise de Sentimento**: Classificação positivo/negativo/neutro usando BERT português
+- ✅ **Extração de Keywords**: Identificação de palavras-chave relevantes
+- ✅ **Detecção de Emoções**: Análise básica de emoções (joy, sadness, anger, fear, surprise)
+- ✅ **Classificação de Categorias de Vendas**: Identificação automática do estágio da conversa usando SBERT
+  - 8 categorias: `price_interest`, `value_exploration`, `objection_soft`, `objection_hard`, `decision_signal`, `information_gathering`, `stalling`, `closing_readiness`
+  - Análise semântica com embeddings SBERT
+  - Confiança calculada automaticamente
+- ✅ **Embeddings Semânticos**: Geração de vetores semânticos (384 dimensões)
+- ✅ **Cache Inteligente**: Cache de resultados para otimização de performance
+- ✅ **Transcrição de Áudio**: Integração com Whisper para transcrição em tempo real
+
 ## Docker (Recomendado)
 
 ### Pré-requisitos
@@ -71,14 +84,19 @@ SOCKETIO_CORS_ORIGINS=*
 # ML Models
 MODEL_CACHE_DIR=/app/models/.cache
 MODEL_DEVICE=cpu
+MODEL_NAME=neuralmind/bert-base-portuguese-cased
 SENTIMENT_MODEL=neuralmind/bert-base-portuguese-cased
 EMOTION_MODEL=cardiffnlp/twitter-roberta-base-emotion
-ENABLE_ML_ANALYSIS=true
+
+# SBERT para classificação de categorias de vendas (opcional mas recomendado)
+SBERT_MODEL_NAME=sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
 
 # Performance
 ANALYSIS_BATCH_SIZE=1
 ANALYSIS_MAX_LENGTH=512
 ```
+<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>
+read_file
 
 ### Verificar se Está Funcionando
 
@@ -262,6 +280,58 @@ TEXT_ANALYSIS_TIMEOUT_MS=5000
 ```
 
 **Nota:** Se o serviço estiver rodando na porta 8000 localmente, use `http://localhost:8000`. Se estiver em outra porta, ajuste conforme necessário.
+
+---
+
+## Classificação de Categorias de Vendas
+
+O serviço inclui classificação automática de categorias de vendas usando análise semântica com SBERT. Esta funcionalidade identifica o estágio da conversa de vendas em tempo real.
+
+### Categorias Disponíveis
+
+- **`price_interest`**: Cliente demonstra interesse em saber o preço
+- **`value_exploration`**: Cliente explora o valor e benefícios da solução
+- **`objection_soft`**: Objeções leves, dúvidas ou hesitações
+- **`objection_hard`**: Objeções fortes e definitivas, rejeição clara
+- **`decision_signal`**: Sinais claros de que o cliente está pronto para decidir
+- **`information_gathering`**: Cliente busca informações adicionais
+- **`stalling`**: Cliente está protelando ou adiando a decisão
+- **`closing_readiness`**: Cliente demonstra prontidão para fechar o negócio
+
+### Configuração
+
+Para habilitar a classificação de categorias de vendas, configure:
+
+```bash
+# No arquivo .env ou docker-compose.yml
+SBERT_MODEL_NAME=sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+```
+
+### Uso
+
+A classificação é automática quando o serviço recebe transcrições. O resultado inclui:
+
+```json
+{
+  "analysis": {
+    "sales_category": "price_interest",
+    "sales_category_confidence": 0.85,
+    ...
+  }
+}
+```
+
+### Validação Manual
+
+Teste a classificação manualmente:
+
+```bash
+python scripts/validate_sales_category.py "Quanto custa isso?"
+```
+
+### Documentação Completa
+
+Para mais detalhes, consulte: [`docs/SALES_CATEGORY_CLASSIFICATION.md`](docs/SALES_CATEGORY_CLASSIFICATION.md)
 
 ---
 
