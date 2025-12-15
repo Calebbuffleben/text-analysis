@@ -35,7 +35,10 @@ class Config:
     ANALYSIS_BATCH_SIZE: int = int(os.getenv('ANALYSIS_BATCH_SIZE', '1'))
     
     # Whisper Configuration (para transcrição de áudio)
-    WHISPER_MODEL_NAME: str = os.getenv('WHISPER_MODEL_NAME', 'base')
+    # IMPORTANTE: O default é 'tiny' para melhor performance
+    # Se WHISPER_MODEL_NAME não estiver definido, usa 'tiny'
+    _whisper_model_env = os.getenv('WHISPER_MODEL_NAME')
+    WHISPER_MODEL_NAME: str = _whisper_model_env if _whisper_model_env is not None else 'tiny'
     WHISPER_DEVICE: str = os.getenv('WHISPER_DEVICE', 'cpu')
     WHISPER_LANGUAGE: str = os.getenv('WHISPER_LANGUAGE', 'pt')
     WHISPER_TASK: str = os.getenv('WHISPER_TASK', 'transcribe')

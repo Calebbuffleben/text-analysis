@@ -20,7 +20,7 @@ logger = structlog.get_logger()
 analysis_service = TextAnalysisService()
 transcription_service = TranscriptionService()
 audio_buffer_service = AudioBufferService(
-    min_duration_sec=3.0,  # Agrupar pelo menos 3 segundos de áudio
+    min_duration_sec=5.0,  # Agrupar pelo menos 5 segundos de áudio (alinhado com backend)
     max_duration_sec=10.0,  # Máximo 10 segundos antes de forçar transcrição
     flush_interval_sec=2.0  # Flush após 2 segundos sem novos chunks
 )

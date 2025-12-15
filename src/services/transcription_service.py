@@ -43,6 +43,17 @@ class TranscriptionService:
         self.language = Config.WHISPER_LANGUAGE
         self.task = Config.WHISPER_TASK
         
+        # Log explícito do modelo que será usado
+        import os
+        env_value = os.getenv('WHISPER_MODEL_NAME', 'NOT_SET')
+        logger.info(
+            "🔍 [TRANSCRIÇÃO] Configuração do modelo Whisper",
+            env_var_WHISPER_MODEL_NAME=env_value,
+            config_WHISPER_MODEL_NAME=self.model_name,
+            device=self.device,
+            language=self.language
+        )
+        
         # Semáforo para limitar transcrições simultâneas
         # Whisper é CPU-intensivo, então limitamos a 1 transcrição por vez
         # para evitar sobrecarga e garantir que cada transcrição tenha recursos completos
@@ -298,7 +309,7 @@ class TranscriptionService:
                         audio_samples=len(audio_array),
                         audio_length_sec=round(len(audio_array) / sample_rate, 2),
                         model=self.model_name,
-                        timeout_sec=15.0
+                        timeout_sec=30.0
                     )
                     
                     # Criar função de transcrição para o executor
@@ -313,10 +324,10 @@ class TranscriptionService:
                             logger.error(f"Erro dentro do transcribe_sync: {e}")
                             raise
                     
-                    # Adicionar timeout de 15 segundos (reduzido para evitar travamentos)
-                    # Whisper tiny deve ser rápido (< 5s para 3s de áudio)
+                    # Adicionar timeout de 30 segundos
+                    # Whisper tiny deve ser rápido (< 5s para 3s de áudio), mas base pode levar ~20-25s
                     task = loop.run_in_executor(self._executor, transcribe_sync)
-                    result = await asyncio.wait_for(task, timeout=15.0)
+                    result = await asyncio.wait_for(task, timeout=30.0)
                     transcribe_latency_ms = (time.perf_counter() - transcribe_start) * 1000
                     
                     logger.info(
@@ -328,7 +339,7 @@ class TranscriptionService:
                 except asyncio.TimeoutError:
                     transcribe_latency_ms = (time.perf_counter() - transcribe_start) * 1000
                     logger.error(
-                        "⏱️ [TRANSCRIÇÃO] Timeout na transcrição (15s excedido)",
+                        "⏱️ [TRANSCRIÇÃO] Timeout na transcrição (30s excedido)",
                         latency_ms=round(transcribe_latency_ms, 2),
                         audio_length_sec=round(len(audio_array) / sample_rate, 2),
                         model=self.model_name
