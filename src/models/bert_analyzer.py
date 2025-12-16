@@ -226,6 +226,64 @@ CATEGORY_PROGRESSION: Dict[str, int] = {
     'objection_hard': -2           # Regressão forte: objeções duras
 }
 
+# ============================================================================
+# KEYWORDS CONDICIONAIS PARA DETECÇÃO DE INDECISÃO (FASE 9)
+# ============================================================================
+# 
+# Lista de palavras e frases que indicam linguagem condicional ou hesitação,
+# característica de clientes indecisos. Usada para detectar padrões de indecisão
+# e melhorar a precisão da detecção de linguagem condicional.
+# 
+# Esta lista pode ser expandida conforme necessário para melhorar a detecção.
+# ============================================================================
+CONDITIONAL_KEYWORDS: List[str] = [
+    # Palavras simples de hesitação
+    'talvez',
+    'pensar',
+    'avaliar',
+    'depois',
+    'ver',
+    'consultar',
+    'depende',
+    'preciso',
+    'deixa',
+    'analisar',
+    'considerar',
+    'refletir',
+    # Frases comuns de hesitação
+    'vou ver',
+    'avaliar melhor',
+    'pensar melhor',
+    'preciso pensar',
+    'vou considerar',
+    'deixa eu ver',
+    'não tenho certeza',
+    'não sei',
+    'talvez depois',
+    'preciso avaliar',
+    'vou analisar',
+    'deixa eu pensar',
+    'não tenho pressa',
+    'sem pressa',
+    'depois eu vejo',
+    # Variações adicionais
+    'preciso consultar',
+    'vou consultar',
+    'deixa eu consultar',
+    'preciso refletir',
+    'vou refletir',
+    'deixa eu refletir',
+    'preciso analisar melhor',
+    'vou analisar melhor',
+    'deixa eu analisar',
+    'não tenho tanta certeza',
+    'não estou certo',
+    'não estou seguro',
+    'preciso de mais tempo',
+    'vou precisar de mais tempo',
+    'deixa eu pensar melhor',
+]
+
 # Baixar recursos NLTK se necessário
 try:
     nltk.data.find('tokenizers/punkt')
@@ -1061,6 +1119,9 @@ class BERTAnalyzer:
             - price_window_open: True se há janela de oportunidade para falar sobre preço
             - decision_signal_strong: True se há sinal forte de que cliente está pronto para decidir
             - ready_to_close: True se cliente demonstra prontidão para fechar o negócio
+            - indecision_detected: True se há sinais de indecisão no texto atual
+            - decision_postponement_signal: True se cliente está postergando decisão
+            - conditional_language_signal: True se há uso de linguagem condicional/aberta
         
         Exemplos:
         =========
@@ -1105,7 +1166,208 @@ class BERTAnalyzer:
             ambiguity < 0.2
         )
         
+        # ========================================================================
+        # FLAGS DE INDECISÃO (FASE 8)
+        # ========================================================================
+        # Flags específicas para detectar padrões de indecisão do cliente
+        # Úteis para facilitar detecção no backend sem recalcular sinais
+        # ========================================================================
+        
+        # Flag: Indecisão detectada
+        # Indica que há sinais de indecisão no texto atual
+        # Requisitos: categoria stalling ou objection_soft + alta ambiguidade ou baixa confiança
+        # Alta ambiguidade indica linguagem condicional, baixa confiança indica hesitação
+        flags['indecision_detected'] = (
+            category in ['stalling', 'objection_soft'] and
+            (ambiguity > 0.6 or confidence < 0.7)
+        )
+        
+        # Flag: Postergação de decisão
+        # Indica que cliente está postergando decisão
+        # Requisitos: categoria stalling + alta confiança + baixa intensidade
+        # Alta confiança = certeza de que é stalling, baixa intensidade = hesitação
+        flags['decision_postponement_signal'] = (
+            category == 'stalling' and
+            confidence > 0.7 and
+            intensity < 0.7  # Intensidade baixa = hesitação
+        )
+        
+        # Flag: Linguagem condicional
+        # Indica uso de linguagem condicional/aberta
+        # Requisitos: alta ambiguidade + categoria de indecisão
+        # Alta ambiguidade indica que texto pode ser interpretado de várias formas
+        flags['conditional_language_signal'] = (
+            category in ['stalling', 'objection_soft'] and
+            ambiguity > 0.7
+        )
+        
         return flags
+    
+    def detect_conditional_keywords(
+        self,
+        text: str,
+        keywords: List[str]
+    ) -> List[str]:
+        """
+        Detecta keywords condicionais no texto e na lista de keywords extraídas.
+        
+        Keywords condicionais são palavras e frases que indicam linguagem condicional
+        ou hesitação, característica de clientes indecisos. Esta função verifica tanto
+        o texto original quanto as keywords extraídas para detectar padrões de indecisão.
+        
+        Args:
+        =====
+        text: str
+            Texto original a ser analisado
+        keywords: List[str]
+            Lista de keywords extraídas do texto (ex: por NLTK)
+        
+        Returns:
+        ========
+        List[str]
+            Lista de keywords condicionais encontradas no texto ou nas keywords extraídas.
+            Retorna lista vazia se nenhuma keyword condicional for encontrada.
+        
+        Exemplos:
+        =========
+        >>> analyzer.detect_conditional_keywords("Preciso pensar melhor", ["pensar", "melhor"])
+        ['pensar', 'pensar melhor']
+        
+        >>> analyzer.detect_conditional_keywords("Talvez depois eu vejo", ["talvez", "depois"])
+        ['talvez', 'depois', 'talvez depois']
+        """
+        text_lower = text.lower()
+        detected: List[str] = []
+        
+        # Verificar keywords condicionais no texto original
+        for conditional in CONDITIONAL_KEYWORDS:
+            conditional_lower = conditional.lower()
+            if conditional_lower in text_lower:
+                # Adicionar apenas se ainda não estiver na lista
+                if conditional not in detected:
+                    detected.append(conditional)
+        
+        # Verificar também nas keywords extraídas
+        # Isso ajuda a capturar variações que podem não estar exatamente no texto
+        for kw in keywords:
+            kw_lower = kw.lower()
+            for conditional in CONDITIONAL_KEYWORDS:
+                conditional_lower = conditional.lower()
+                # Verificar se a keyword contém ou é similar a uma keyword condicional
+                if conditional_lower in kw_lower or kw_lower in conditional_lower:
+                    if conditional not in detected:
+                        detected.append(conditional)
+        
+        return detected
+    
+    def calculate_indecision_metrics(
+        self,
+        category: Optional[str],
+        confidence: float,
+        intensity: float,
+        ambiguity: float,
+        conditional_keywords: List[str]
+    ) -> Dict[str, Any]:
+        """
+        Calcula métricas específicas de indecisão baseadas em análise semântica.
+        
+        Métricas calculadas:
+        - indecision_score: Score geral de indecisão (0.0 a 1.0)
+        - postponement_likelihood: Probabilidade de postergação de decisão (0.0 a 1.0)
+        - conditional_language_score: Score de linguagem condicional (0.0 a 1.0)
+        
+        Estas métricas são pré-calculadas no Python para facilitar heurísticas no backend,
+        reduzindo processamento e permitindo uso em múltiplas análises.
+        
+        Args:
+        =====
+        category: Optional[str]
+            Categoria de vendas detectada (None se nenhuma)
+        confidence: float
+            Confiança da classificação (0.0 a 1.0)
+        intensity: float
+            Intensidade do sinal semântico (0.0 a 1.0)
+        ambiguity: float
+            Ambiguidade semântica (0.0 = claro, 1.0 = muito ambíguo)
+        conditional_keywords: List[str]
+            Lista de keywords condicionais detectadas no texto
+        
+        Returns:
+        ========
+        Dict[str, Any]
+            Dicionário com métricas de indecisão:
+            - indecision_score: float (0.0 a 1.0) - Score geral de indecisão
+            - postponement_likelihood: float (0.0 a 1.0) - Probabilidade de postergação
+            - conditional_language_score: float (0.0 a 1.0) - Score de linguagem condicional
+        
+        Exemplos:
+        =========
+        >>> metrics = analyzer.calculate_indecision_metrics(
+        ...     'stalling', 0.8, 0.6, 0.7, ['pensar', 'depois']
+        ... )
+        >>> metrics['indecision_score']  # Score alto devido a stalling + alta ambiguidade
+        >>> metrics['postponement_likelihood']  # Alta probabilidade de postergação
+        """
+        metrics: Dict[str, Any] = {
+            'indecision_score': 0.0,
+            'postponement_likelihood': 0.0,
+            'conditional_language_score': 0.0,
+        }
+        
+        # ========================================================================
+        # Score geral de indecisão
+        # ========================================================================
+        # Baseado em categoria de indecisão, ambiguidade e confiança
+        # Categorias de indecisão: stalling (mais forte) e objection_soft (moderado)
+        if category in ['stalling', 'objection_soft']:
+            # Score base varia por categoria
+            # stalling indica protelação explícita (score base maior)
+            # objection_soft indica hesitação moderada (score base menor)
+            base_score = 0.5 if category == 'stalling' else 0.3
+            
+            # Alta ambiguidade aumenta score de indecisão
+            # Textos ambíguos são mais difíceis de interpretar = mais indecisos
+            ambiguity_boost = ambiguity * 0.3
+            
+            # Baixa confiança aumenta score de indecisão
+            # Se não há certeza na classificação, pode indicar hesitação
+            confidence_penalty = (1.0 - confidence) * 0.2
+            
+            # Calcular score final (limitado a 1.0)
+            metrics['indecision_score'] = min(1.0, base_score + ambiguity_boost + confidence_penalty)
+        
+        # ========================================================================
+        # Probabilidade de postergação de decisão
+        # ========================================================================
+        # Calculada apenas para categoria stalling (protelação explícita)
+        # Baseada em confiança e intensidade
+        if category == 'stalling':
+            # Alta confiança + baixa intensidade = alta probabilidade de postergação
+            # Alta confiança = certeza de que é stalling
+            # Baixa intensidade = hesitação (não está comprometido)
+            metrics['postponement_likelihood'] = min(1.0, confidence * (1.0 - intensity * 0.5))
+        
+        # ========================================================================
+        # Score de linguagem condicional
+        # ========================================================================
+        # Baseado em keywords condicionais detectadas e ambiguidade
+        if conditional_keywords:
+            # Quanto mais keywords condicionais, maior o score
+            # Normalizado para máximo de 5 keywords (score máximo = 1.0)
+            keyword_score = min(1.0, len(conditional_keywords) / 5.0)
+            metrics['conditional_language_score'] = keyword_score
+        
+        # Alta ambiguidade também indica linguagem condicional
+        # Mesmo sem keywords explícitas, ambiguidade alta sugere linguagem condicional
+        ambiguity_score = ambiguity * 0.5
+        
+        # Usar o maior entre score de keywords e score de ambiguidade
+        metrics['conditional_language_score'] = max(
+            metrics['conditional_language_score'],
+            ambiguity_score
+        )
+        
+        return metrics
     
     def _calculate_ambiguity(self, scores: Dict[str, float]) -> float:
         """
