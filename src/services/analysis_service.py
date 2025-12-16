@@ -324,45 +324,6 @@ class TextAnalysisService:
                 meeting_id=chunk.meetingId
             )
         
-        # ========================================================================
-        # FASE 10: CÁLCULO DE MÉTRICAS DE INDECISÃO
-        # ========================================================================
-        # Calcula métricas específicas de indecisão para facilitar análise no backend.
-        # Métricas pré-calculadas reduzem processamento no backend e podem ser
-        # usadas em múltiplas heurísticas.
-        # ========================================================================
-        indecision_metrics: Dict[str, Any] = {}
-        try:
-            if Config.SBERT_MODEL_NAME and sales_category is not None:
-                logger.debug(
-                    "📊 [ANÁLISE] Calculando métricas de indecisão",
-                    meeting_id=chunk.meetingId,
-                    sales_category=sales_category
-                )
-                indecision_metrics = analyzer.calculate_indecision_metrics(
-                    sales_category,
-                    sales_category_confidence or 0.0,
-                    sales_category_intensity or 0.0,
-                    sales_category_ambiguity or 0.0,
-                    conditional_keywords_detected
-                )
-                if indecision_metrics:
-                    logger.debug(
-                        "✅ [ANÁLISE] Métricas de indecisão calculadas",
-                        meeting_id=chunk.meetingId,
-                        indecision_score=round(indecision_metrics.get('indecision_score', 0.0), 4),
-                        postponement_likelihood=round(indecision_metrics.get('postponement_likelihood', 0.0), 4),
-                        conditional_language_score=round(indecision_metrics.get('conditional_language_score', 0.0), 4)
-                    )
-        except Exception as e:
-            # Não bloquear análise se cálculo de métricas falhar
-            logger.warn(
-                "⚠️ [ANÁLISE] Falha ao calcular métricas de indecisão, continuando sem elas",
-                error=str(e),
-                error_type=type(e).__name__,
-                meeting_id=chunk.meetingId
-            )
-        
         # Obter embedding completo se disponível
         embedding = []
         try:
@@ -507,6 +468,46 @@ class TextAnalysisService:
             sales_category_ambiguity = None
             sales_category_intensity = None
             sales_category_flags = {}
+        
+        # ========================================================================
+        # FASE 10: CÁLCULO DE MÉTRICAS DE INDECISÃO
+        # ========================================================================
+        # Calcula métricas específicas de indecisão para facilitar análise no backend.
+        # Métricas pré-calculadas reduzem processamento no backend e podem ser
+        # usadas em múltiplas heurísticas.
+        # IMPORTANTE: Deve vir APÓS a classificação de categoria de vendas.
+        # ========================================================================
+        indecision_metrics: Dict[str, Any] = {}
+        try:
+            if Config.SBERT_MODEL_NAME and sales_category is not None:
+                logger.debug(
+                    "📊 [ANÁLISE] Calculando métricas de indecisão",
+                    meeting_id=chunk.meetingId,
+                    sales_category=sales_category
+                )
+                indecision_metrics = analyzer.calculate_indecision_metrics(
+                    sales_category,
+                    sales_category_confidence or 0.0,
+                    sales_category_intensity or 0.0,
+                    sales_category_ambiguity or 0.0,
+                    conditional_keywords_detected
+                )
+                if indecision_metrics:
+                    logger.debug(
+                        "✅ [ANÁLISE] Métricas de indecisão calculadas",
+                        meeting_id=chunk.meetingId,
+                        indecision_score=round(indecision_metrics.get('indecision_score', 0.0), 4),
+                        postponement_likelihood=round(indecision_metrics.get('postponement_likelihood', 0.0), 4),
+                        conditional_language_score=round(indecision_metrics.get('conditional_language_score', 0.0), 4)
+                    )
+        except Exception as e:
+            # Não bloquear análise se cálculo de métricas falhar
+            logger.warn(
+                "⚠️ [ANÁLISE] Falha ao calcular métricas de indecisão, continuando sem elas",
+                error=str(e),
+                error_type=type(e).__name__,
+                meeting_id=chunk.meetingId
+            )
         
         # ========================================================================
         # CONTEXTO CONVERSACIONAL
