@@ -8,6 +8,7 @@ import structlog
 import time
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from .config import Config
 from .socketio_server import app as socketio_app
 from .services.analysis_service import TextAnalysisService
@@ -80,6 +81,15 @@ fastapi_app = FastAPI(
     title="Text Analysis Service",
     description="Serviço de análise de texto com BERT para português",
     version="1.0.0"
+)
+
+# Configurar CORS para permitir requisições HTTP de polling do Socket.IO
+fastapi_app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Permitir todas as origens (ou configurar específicas para produção)
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # Instanciar serviço de análise
