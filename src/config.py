@@ -12,7 +12,12 @@ class Config:
     
     # Server Configuration
     PORT: int = int(os.getenv('PORT', '8000'))
-    HOST: str = os.getenv('HOST', 'backend-analysis-production-a688.up.railway.app')
+    # Bind host: always use 0.0.0.0 in containers to listen on all interfaces
+    # Railway sets HOST with an IP for routing, but we need 0.0.0.0 for bind
+    # The public hostname is still backend-analysis-production-a688.up.railway.app
+    HOST: str = '0.0.0.0'  # Required for Docker/Railway containers
+    # Public hostname for external access (used in logs/references)
+    PUBLIC_HOSTNAME: str = os.getenv('PUBLIC_HOSTNAME', 'backend-analysis-production-a688.up.railway.app')
     LOG_LEVEL: str = os.getenv('LOG_LEVEL', 'INFO')
     
     # Socket.IO Configuration

@@ -238,7 +238,8 @@ if __name__ == "__main__":
     
     logger.info(
         "🚀 [INICIALIZAÇÃO] Iniciando Text Analysis Service",
-        host=Config.HOST,
+        host=Config.PUBLIC_HOSTNAME,  # Use public hostname for logs
+        bind_host=Config.HOST,  # Show bind host (0.0.0.0) separately
         port=Config.PORT,
         model=Config.MODEL_NAME,
         sbert_model=Config.SBERT_MODEL_NAME,
