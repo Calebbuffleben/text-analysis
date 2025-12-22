@@ -12,7 +12,7 @@ class Config:
     
     # Server Configuration
     PORT: int = int(os.getenv('PORT', '8000'))
-    HOST: str = os.getenv('HOST', '0.0.0.0')
+    HOST: str = os.getenv('HOST', 'backend-analysis-production-a688.up.railway.app')
     LOG_LEVEL: str = os.getenv('LOG_LEVEL', 'INFO')
     
     # Socket.IO Configuration

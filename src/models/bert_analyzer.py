@@ -237,20 +237,7 @@ CATEGORY_PROGRESSION: Dict[str, int] = {
 # Esta lista pode ser expandida conforme necessário para melhorar a detecção.
 # ============================================================================
 CONDITIONAL_KEYWORDS: List[str] = [
-    # Palavras simples de hesitação
-    'talvez',
-    'pensar',
-    'avaliar',
-    'depois',
-    'ver',
-    'consultar',
-    'depende',
-    'preciso',
-    'deixa',
-    'analisar',
-    'considerar',
-    'refletir',
-    # Frases comuns de hesitação
+    # Frases específicas de hesitação (removidas palavras simples para evitar falsos positivos)
     'vou ver',
     'avaliar melhor',
     'pensar melhor',
@@ -258,7 +245,7 @@ CONDITIONAL_KEYWORDS: List[str] = [
     'vou considerar',
     'deixa eu ver',
     'não tenho certeza',
-    'não sei',
+    'não sei se',
     'talvez depois',
     'preciso avaliar',
     'vou analisar',
@@ -266,7 +253,6 @@ CONDITIONAL_KEYWORDS: List[str] = [
     'não tenho pressa',
     'sem pressa',
     'depois eu vejo',
-    # Variações adicionais
     'preciso consultar',
     'vou consultar',
     'deixa eu consultar',
@@ -282,6 +268,14 @@ CONDITIONAL_KEYWORDS: List[str] = [
     'preciso de mais tempo',
     'vou precisar de mais tempo',
     'deixa eu pensar melhor',
+    # Frases de adiamento
+    'vou pensar',
+    'vou pensar sobre isso',
+    'depois a gente vê',
+    'depois eu decido',
+    'ainda não sei',
+    'não sei ainda',
+    'depende de',
 ]
 
 # Baixar recursos NLTK se necessário

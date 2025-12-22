@@ -590,10 +590,17 @@ async def audio_chunk(sid, data: Dict[str, Any]):
         # Enviar resultado de volta via Socket.IO
         # Pydantic v2.5.3 usa model_dump() ao invés de dict()
         result_dict = result.model_dump()
-        await sio.emit('text_analysis_result', result_dict, room=sid)
+        # 🔴 BROADCAST: Envia para TODOS os clientes conectados (extensão E backend)
+        logger.debug(
+            "🔴 [DIAGNOSTICO] Emitindo text_analysis_result via BROADCAST",
+            client_id=sid,
+            meeting_id=chunk.meetingId,
+            participant_id=chunk.participantId
+        )
+        await sio.emit('text_analysis_result', result_dict)
         
         logger.info(
-            "📤 [FLUXO] Resultado de análise enviado (do áudio)",
+            "📤 [FLUXO] Resultado de análise enviado (do áudio) [BROADCAST]",
             client_id=sid,
             meeting_id=chunk.meetingId,
             participant_id=chunk.participantId,
