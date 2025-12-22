@@ -103,11 +103,19 @@ async def on_buffer_ready(meeting_id: str, participant_id: str, track: str,
 audio_buffer_service.set_callback(on_buffer_ready)
 
 # Criar servidor Socket.IO
+# Configurações para melhor compatibilidade com Railway e polling HTTP
 sio = socketio.AsyncServer(
     cors_allowed_origins=Config.SOCKETIO_CORS_ORIGINS,
     async_mode='asgi',
     logger=False,  # Usar structlog ao invés do logger padrão
-    engineio_logger=False
+    engineio_logger=False,
+    # Permitir todos os métodos de transporte (polling e websocket)
+    allow_upgrades=True,
+    # Configurações para melhor compatibilidade com proxies/reverse proxies
+    ping_timeout=60,
+    ping_interval=25,
+    # Permitir polling HTTP (necessário para alguns ambientes)
+    transports=['polling', 'websocket'],
 )
 
 # Handlers de conexão
