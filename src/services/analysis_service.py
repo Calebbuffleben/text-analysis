@@ -381,6 +381,9 @@ class TextAnalysisService:
         # ========================================================================
         sales_category = None
         sales_category_confidence = None
+        sales_category_ambiguity = None
+        sales_category_intensity = None
+        sales_category_flags: Dict[str, bool] = {}
         try:
             if Config.SBERT_MODEL_NAME:
                 logger.debug(
@@ -468,6 +471,18 @@ class TextAnalysisService:
             sales_category_ambiguity = None
             sales_category_intensity = None
             sales_category_flags = {}
+
+        # ========================================================================
+        # (Opcional) Reformulação do cliente ("solução foi compreendida")
+        # ========================================================================
+        # Detecta marcadores linguísticos de reformulação/teach-back no texto atual.
+        # OBS: não tenta calcular similaridade com contexto (isso é melhor no backend,
+        # que já gerencia estado por meeting e cooldowns).
+        reformulation_markers_detected = self._detect_reformulation_markers(chunk.text)
+        reformulation_marker_score = min(1.0, len(reformulation_markers_detected) / 2.0)
+        if reformulation_marker_score > 0.0:
+            # Flag genérica para heurísticas no backend (não depende de category)
+            sales_category_flags['solution_reformulation_signal'] = True
         
         # ========================================================================
         # FASE 10: CÁLCULO DE MÉTRICAS DE INDECISÃO
@@ -670,7 +685,10 @@ class TextAnalysisService:
             # Keywords condicionais detectadas (FASE 9)
             'conditional_keywords_detected': conditional_keywords_detected,
             # Métricas de indecisão (FASE 10)
-            'indecision_metrics': indecision_metrics if indecision_metrics else None
+            'indecision_metrics': indecision_metrics if indecision_metrics else None,
+            # Reformulação do cliente (teach-back) — sinais leves (sem contexto)
+            'reformulation_markers_detected': reformulation_markers_detected,
+            'reformulation_marker_score': reformulation_marker_score
         }
         
         # Armazenar no cache
@@ -715,6 +733,34 @@ class TextAnalysisService:
         )
         
         return result
+
+    def _detect_reformulation_markers(self, text: str) -> List[str]:
+        """
+        Detecta marcadores de reformulação/teach-back (PT-BR) no texto.
+
+        Retorna uma lista de marcadores encontrados (strings).
+        """
+        t = (text or "").lower()
+        markers = [
+            "deixa eu ver se entendi",
+            "só pra confirmar",
+            "se eu entendi",
+            "entendi então",
+            "entendi que",
+            "então vocês",
+            "então o que você está dizendo é",
+            "quer dizer que",
+            "ou seja",
+            "resumindo",
+            "em resumo",
+            "na prática então",
+            "basicamente",
+        ]
+        found: List[str] = []
+        for m in markers:
+            if m in t:
+                found.append(m)
+        return found
     
     def _detect_intent(self, text: str, has_question: bool) -> Tuple[str, float]:
         """

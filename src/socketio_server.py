@@ -202,6 +202,7 @@ async def disconnect(sid):
 
 
 @sio.event
+# TODO: (Flow) Pre-transcribed text ingestion (`transcription_chunk`) is not used in the current main pipeline (audio_chunk → buffer → Whisper). Kept as an optional fallback.
 async def transcription_chunk(sid, data: Dict[str, Any]):
     """
     Handler principal: recebe chunk de transcrição e retorna análise.
