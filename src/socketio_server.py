@@ -654,3 +654,19 @@ async def ping(sid, data: Dict[str, Any]):
         'service': 'text-analysis'
     }, room=sid)
 
+
+@sio.event
+async def health_ping(sid, data: Dict[str, Any]):
+    """
+    Health check ping/pong (custom event names to avoid any collision with
+    Socket.IO / Engine.IO internal heartbeat packets).
+    """
+    await sio.emit(
+        'health_pong',
+        {
+            'timestamp': data.get('timestamp'),
+            'service': 'text-analysis'
+        },
+        room=sid
+    )
+
