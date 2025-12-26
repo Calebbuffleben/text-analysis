@@ -227,7 +227,7 @@ CATEGORY_PROGRESSION: Dict[str, int] = {
 }
 
 # ============================================================================
-# KEYWORDS CONDICIONAIS PARA DETECÇÃO DE INDECISÃO (FASE 9)
+# KEYWORDS CONDICIONAIS PARA DETECÇÃO DE INDECISÃO
 # ============================================================================
 # 
 # Lista de palavras e frases que indicam linguagem condicional ou hesitação,

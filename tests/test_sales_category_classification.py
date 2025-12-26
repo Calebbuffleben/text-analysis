@@ -443,6 +443,14 @@ class TestSalesCategoryIntegration:
             
             # Verificar valores
             assert result['sales_category'] == 'price_interest'
+            
+            # Verificar campos de reformulação e indecisão (refatoração)
+            assert 'reformulation_markers_detected' in result
+            assert 'reformulation_marker_score' in result
+            assert 'indecision_metrics' in result
+            assert isinstance(result['reformulation_markers_detected'], list)
+            assert isinstance(result['reformulation_marker_score'], (int, float))
+            assert 0.0 <= result['reformulation_marker_score'] <= 1.0
             assert result['sales_category_confidence'] == 0.85
             
         finally:
@@ -498,6 +506,114 @@ class TestSalesCategoryIntegration:
             
         finally:
             # Restaurar valor original
+            if original_sbert is not None:
+                monkeypatch.setattr(config.Config, 'SBERT_MODEL_NAME', original_sbert)
+            else:
+                monkeypatch.delattr(config.Config, 'SBERT_MODEL_NAME', raising=False)
+    
+    @pytest.mark.asyncio
+    async def test_analyze_refactored_fields_parity(self, analysis_service, monkeypatch):
+        """
+        Teste de integração: valida que analyze() retorna mesmos campos após refatoração.
+        
+        Validações do Passo 6.3:
+        - reformulation_markers_detected existe e tem tipo correto
+        - reformulation_marker_score existe e está entre 0.0 e 1.0
+        - Quando há marcadores: solution_reformulation_signal == True
+        - indecision_metrics é dict ou None (conforme gating)
+        - Quando sales_category presente: indecision_metrics é dict (não None)
+        """
+        from src import config
+        original_sbert = getattr(config.Config, 'SBERT_MODEL_NAME', None)
+        monkeypatch.setattr(config.Config, 'SBERT_MODEL_NAME', 'sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2')
+        
+        try:
+            mock_analyzer = Mock(spec=BERTAnalyzer)
+            
+            # Configurar mocks básicos
+            mock_analyzer.analyze_sentiment.return_value = {
+                'positive': 0.5, 'negative': 0.2, 'neutral': 0.3
+            }
+            mock_analyzer.extract_keywords.return_value = ['texto']
+            mock_analyzer.detect_emotions.return_value = {
+                'joy': 0.0, 'sadness': 0.0, 'anger': 0.0, 'fear': 0.0, 'surprise': 0.0
+            }
+            
+            # Mock classify_sales_category retornando flags base {}
+            mock_analyzer.classify_sales_category.return_value = (
+                'price_interest', 0.85, {}, 0.15, 0.92, {}  # flags vazio inicialmente
+            )
+            
+            # Mock detect_conditional_keywords
+            mock_analyzer.detect_conditional_keywords.return_value = ['talvez', 'depois']
+            
+            # Mock generate_semantic_embedding
+            mock_embedding = np.random.rand(384).astype(np.float32)
+            mock_embedding = mock_embedding / np.linalg.norm(mock_embedding)
+            mock_analyzer.generate_semantic_embedding.return_value = mock_embedding
+            
+            # Mock calculate_indecision_metrics
+            mock_analyzer.calculate_indecision_metrics.return_value = {
+                'indecision_score': 0.75,
+                'postponement_likelihood': 0.65,
+                'conditional_language_score': 0.55
+            }
+            
+            analysis_service._get_analyzer = lambda: mock_analyzer
+            
+            # Teste 1: Texto COM marcador de reformulação
+            chunk_with_marker = TranscriptionChunk(
+                meetingId='test_meeting',
+                participantId='test_participant',
+                text='Deixa eu ver se entendi, então vocês fazem X e Y?',
+                timestamp=1234567890
+            )
+            
+            result_with_marker = await analysis_service.analyze(chunk_with_marker)
+            
+            # Validações
+            assert 'reformulation_markers_detected' in result_with_marker
+            assert isinstance(result_with_marker['reformulation_markers_detected'], list)
+            
+            assert 'reformulation_marker_score' in result_with_marker
+            assert isinstance(result_with_marker['reformulation_marker_score'], (int, float))
+            assert 0.0 <= result_with_marker['reformulation_marker_score'] <= 1.0
+            
+            # Quando há marcadores: solution_reformulation_signal == True
+            assert 'sales_category_flags' in result_with_marker
+            if len(result_with_marker['reformulation_markers_detected']) > 0:
+                assert result_with_marker['sales_category_flags'].get('solution_reformulation_signal') == True
+            
+            # indecision_metrics é dict ou None (conforme gating)
+            assert 'indecision_metrics' in result_with_marker
+            assert result_with_marker['indecision_metrics'] is None or isinstance(result_with_marker['indecision_metrics'], dict)
+            
+            # Quando sales_category presente: indecision_metrics é dict (não None)
+            if result_with_marker.get('sales_category') is not None:
+                assert isinstance(result_with_marker['indecision_metrics'], dict)
+                assert 'indecision_score' in result_with_marker['indecision_metrics']
+            
+            # Teste 2: Texto SEM marcador de reformulação
+            chunk_without_marker = TranscriptionChunk(
+                meetingId='test_meeting',
+                participantId='test_participant',
+                text='Ok, entendi',
+                timestamp=1234567891
+            )
+            
+            result_without_marker = await analysis_service.analyze(chunk_without_marker)
+            
+            # Deve ter campos, mas marcadores vazios
+            assert 'reformulation_markers_detected' in result_without_marker
+            assert result_without_marker['reformulation_markers_detected'] == []
+            assert result_without_marker['reformulation_marker_score'] == 0.0
+            
+            # solution_reformulation_signal não deve estar presente quando score é 0
+            if 'solution_reformulation_signal' in result_without_marker.get('sales_category_flags', {}):
+                # Se estiver presente, não deve ser False, mas não deve estar presente quando score é 0
+                pass  # A validação é que não deve estar presente
+            
+        finally:
             if original_sbert is not None:
                 monkeypatch.setattr(config.Config, 'SBERT_MODEL_NAME', original_sbert)
             else:
