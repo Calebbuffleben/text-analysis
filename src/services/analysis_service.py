@@ -10,6 +10,12 @@ from ..models.conversation_context import ConversationContext
 from ..services.cache_service import AnalysisCache
 from ..metrics.semantic_metrics import SemanticMetrics
 from ..config import Config
+from ..signals.reformulation import (
+    detect_reformulation_markers,
+    compute_reformulation_marker_score,
+    apply_solution_reformulation_signal_flag
+)
+from ..signals.indecision import compute_indecision_metrics_safe
 import structlog
 import time
 
@@ -478,11 +484,9 @@ class TextAnalysisService:
         # Detecta marcadores linguísticos de reformulação/teach-back no texto atual.
         # OBS: não tenta calcular similaridade com contexto (isso é melhor no backend,
         # que já gerencia estado por meeting e cooldowns).
-        reformulation_markers_detected = self._detect_reformulation_markers(chunk.text)
-        reformulation_marker_score = min(1.0, len(reformulation_markers_detected) / 2.0)
-        if reformulation_marker_score > 0.0:
-            # Flag genérica para heurísticas no backend (não depende de category)
-            sales_category_flags['solution_reformulation_signal'] = True
+        reformulation_markers_detected = detect_reformulation_markers(chunk.text)
+        reformulation_marker_score = compute_reformulation_marker_score(reformulation_markers_detected)
+        apply_solution_reformulation_signal_flag(sales_category_flags, reformulation_marker_score)
         
         # ========================================================================
         # FASE 10: CÁLCULO DE MÉTRICAS DE INDECISÃO
@@ -492,36 +496,24 @@ class TextAnalysisService:
         # usadas em múltiplas heurísticas.
         # IMPORTANTE: Deve vir APÓS a classificação de categoria de vendas.
         # ========================================================================
-        indecision_metrics: Dict[str, Any] = {}
-        try:
-            if Config.SBERT_MODEL_NAME and sales_category is not None:
-                logger.debug(
-                    "📊 [ANÁLISE] Calculando métricas de indecisão",
-                    meeting_id=chunk.meetingId,
-                    sales_category=sales_category
-                )
-                indecision_metrics = analyzer.calculate_indecision_metrics(
-                    sales_category,
-                    sales_category_confidence or 0.0,
-                    sales_category_intensity or 0.0,
-                    sales_category_ambiguity or 0.0,
-                    conditional_keywords_detected
-                )
-                if indecision_metrics:
-                    logger.debug(
-                        "✅ [ANÁLISE] Métricas de indecisão calculadas",
-                        meeting_id=chunk.meetingId,
-                        indecision_score=round(indecision_metrics.get('indecision_score', 0.0), 4),
-                        postponement_likelihood=round(indecision_metrics.get('postponement_likelihood', 0.0), 4),
-                        conditional_language_score=round(indecision_metrics.get('conditional_language_score', 0.0), 4)
-                    )
-        except Exception as e:
-            # Não bloquear análise se cálculo de métricas falhar
-            logger.warn(
-                "⚠️ [ANÁLISE] Falha ao calcular métricas de indecisão, continuando sem elas",
-                error=str(e),
-                error_type=type(e).__name__,
-                meeting_id=chunk.meetingId
+        sbert_enabled = bool(Config.SBERT_MODEL_NAME)
+        indecision_metrics = compute_indecision_metrics_safe(
+            analyzer=analyzer,
+            sbert_enabled=sbert_enabled,
+            sales_category=sales_category,
+            sales_category_confidence=sales_category_confidence,
+            sales_category_intensity=sales_category_intensity,
+            sales_category_ambiguity=sales_category_ambiguity,
+            conditional_keywords_detected=conditional_keywords_detected,
+            meeting_id=chunk.meetingId
+        )
+        if indecision_metrics:
+            logger.debug(
+                "✅ [ANÁLISE] Métricas de indecisão calculadas",
+                meeting_id=chunk.meetingId,
+                indecision_score=round(indecision_metrics.get('indecision_score', 0.0), 4),
+                postponement_likelihood=round(indecision_metrics.get('postponement_likelihood', 0.0), 4),
+                conditional_language_score=round(indecision_metrics.get('conditional_language_score', 0.0), 4)
             )
         
         # ========================================================================
@@ -733,34 +725,6 @@ class TextAnalysisService:
         )
         
         return result
-
-    def _detect_reformulation_markers(self, text: str) -> List[str]:
-        """
-        Detecta marcadores de reformulação/teach-back (PT-BR) no texto.
-
-        Retorna uma lista de marcadores encontrados (strings).
-        """
-        t = (text or "").lower()
-        markers = [
-            "deixa eu ver se entendi",
-            "só pra confirmar",
-            "se eu entendi",
-            "entendi então",
-            "entendi que",
-            "então vocês",
-            "então o que você está dizendo é",
-            "quer dizer que",
-            "ou seja",
-            "resumindo",
-            "em resumo",
-            "na prática então",
-            "basicamente",
-        ]
-        found: List[str] = []
-        for m in markers:
-            if m in t:
-                found.append(m)
-        return found
     
     def _detect_intent(self, text: str, has_question: bool) -> Tuple[str, float]:
         """
