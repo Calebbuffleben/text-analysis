@@ -7,7 +7,6 @@ Testa todas as funções do módulo signals.reformulation:
 - apply_solution_reformulation_signal_flag
 """
 
-import pytest
 from src.signals.reformulation import (
     detect_reformulation_markers,
     compute_reformulation_marker_score,
@@ -37,23 +36,12 @@ class TestDetectReformulationMarkers:
     
     def test_detect_markers_mantem_ordem(self):
         """Verificar que ordem do retorno segue ordem do array markers"""
-        text = "só pra confirmar, quer dizer que vocês fazem isso"
+        # Coloca os marcadores em ordem invertida no texto para garantir que
+        # a ordem do retorno segue o array `markers` (não a ordem no texto).
+        text = "quer dizer que vocês fazem isso, só pra confirmar"
         markers = detect_reformulation_markers(text)
-        
-        # Verificar que a ordem segue a ordem no array original
-        # O primeiro marcador encontrado deve vir antes
-        all_markers_in_text = [
-            "só pra confirmar",
-            "quer dizer que"
-        ]
-        
-        # Se ambos estão presentes, verificar ordem relativa
-        if len(markers) >= 2:
-            idx_confirmar = markers.index("só pra confirmar") if "só pra confirmar" in markers else -1
-            idx_quer_dizer = markers.index("quer dizer que") if "quer dizer que" in markers else -1
-            
-            if idx_confirmar != -1 and idx_quer_dizer != -1:
-                assert idx_confirmar < idx_quer_dizer
+
+        assert markers == ["só pra confirmar", "quer dizer que"]
     
     def test_detect_markers_case_insensitive(self):
         """Verificar que DEIXA EU VER funciona (case insensitive)"""
@@ -74,13 +62,16 @@ class TestDetectReformulationMarkers:
     
     def test_detect_markers_multiplos_marcadores(self):
         """Testar detecção de múltiplos marcadores"""
-        text = "Deixa eu ver se entendi, então quer dizer que vocês fazem isso"
+        text = "Ou seja, deixa eu ver se entendi — só pra confirmar — então vocês fazem isso."
         markers = detect_reformulation_markers(text)
-        
-        assert len(markers) >= 3
-        assert "deixa eu ver se entendi" in markers
-        assert "então vocês" in markers or "então o que você está dizendo é" in markers
-        assert "quer dizer que" in markers
+
+        # Ordem deve seguir o array `markers`
+        assert markers == [
+            "deixa eu ver se entendi",
+            "só pra confirmar",
+            "então vocês",
+            "ou seja",
+        ]
 
 
 class TestComputeReformulationMarkerScore:

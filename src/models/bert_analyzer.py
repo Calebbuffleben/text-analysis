@@ -1166,14 +1166,27 @@ class BERTAnalyzer:
         # Flags específicas para detectar padrões de indecisão do cliente
         # Úteis para facilitar detecção no backend sem recalcular sinais
         # ========================================================================
+        #
+        # ⚠️ IMPORTANTE:
+        # "confidence" aqui é a separação relativa entre a melhor e a segunda melhor
+        # categoria (gap/score), e "ambiguity" mede o quão espalhados estão os scores.
+        # Esses valores representam INCERTEZA DO CLASSIFICADOR, não necessariamente
+        # indecisão do cliente. Se tratarmos baixa confiança/alta ambiguidade como
+        # "indecisão", geramos falsos positivos (ex.: qualquer frase ambígua vira
+        # 'cliente hesitante').
+        #
+        # Por isso, os flags abaixo são conservadores e se baseiam principalmente
+        # em "intensity" (força do match semântico) e na categoria detectada.
         
         # Flag: Indecisão detectada
         # Indica que há sinais de indecisão no texto atual
-        # Requisitos: categoria stalling ou objection_soft + alta ambiguidade ou baixa confiança
-        # Alta ambiguidade indica linguagem condicional, baixa confiança indica hesitação
+        # Requisitos: match semântico suficientemente forte em uma categoria de indecisão.
+        # NOTA: objection_soft pode representar objeção/dúvida (nem sempre indecisão),
+        # então evitamos ligar o flag por "incerteza do classificador".
+        min_indecision_intensity = 0.40
         flags['indecision_detected'] = (
-            category in ['stalling', 'objection_soft'] and
-            (ambiguity > 0.6 or confidence < 0.7)
+            category == 'stalling' and
+            intensity >= min_indecision_intensity
         )
         
         # Flag: Postergação de decisão
@@ -1188,12 +1201,10 @@ class BERTAnalyzer:
         
         # Flag: Linguagem condicional
         # Indica uso de linguagem condicional/aberta
-        # Requisitos: alta ambiguidade + categoria de indecisão
-        # Alta ambiguidade indica que texto pode ser interpretado de várias formas
-        flags['conditional_language_signal'] = (
-            category in ['stalling', 'objection_soft'] and
-            ambiguity > 0.7
-        )
+        # Requisitos: este flag era baseado em ambiguidade (incerteza do classificador),
+        # o que gera falsos positivos. A detecção de linguagem condicional deve ser
+        # guiada por marcadores/keywords condicionais (ver detect_conditional_keywords
+        # e conditional_language_score), então NÃO setamos este flag aqui.
         
         return flags
     
@@ -1308,10 +1319,18 @@ class BERTAnalyzer:
             'conditional_language_score': 0.0,
         }
         
+        # Se o match semântico é muito fraco (próximo ao min_confidence do classificador),
+        # não vale a pena inferir métricas de indecisão a partir disso.
+        # Isso reduz falsos positivos quando a classificação está "por um fio".
+        if category in ['stalling', 'objection_soft'] and intensity < 0.35:
+            return metrics
+
         # ========================================================================
         # Score geral de indecisão
         # ========================================================================
-        # Baseado em categoria de indecisão, ambiguidade e confiança
+        # Baseado em categoria de indecisão + sinais explícitos (keywords) + sinais
+        # fracos de incerteza do classificador (ambiguidade/confiança), com pesos
+        # conservadores para evitar falsos positivos.
         # Categorias de indecisão: stalling (mais forte) e objection_soft (moderado)
         if category in ['stalling', 'objection_soft']:
             # Score base varia por categoria
@@ -1319,16 +1338,21 @@ class BERTAnalyzer:
             # objection_soft indica hesitação moderada (score base menor)
             base_score = 0.5 if category == 'stalling' else 0.3
             
-            # Alta ambiguidade aumenta score de indecisão
-            # Textos ambíguos são mais difíceis de interpretar = mais indecisos
-            ambiguity_boost = ambiguity * 0.3
-            
-            # Baixa confiança aumenta score de indecisão
-            # Se não há certeza na classificação, pode indicar hesitação
-            confidence_penalty = (1.0 - confidence) * 0.2
-            
+            # Keywords condicionais (sinais explícitos) aumentam score de indecisão
+            # Normalizado para máximo de 5 keywords (boost máximo = 0.30)
+            keyword_boost = min(0.30, (len(conditional_keywords) / 5.0) * 0.30) if conditional_keywords else 0.0
+
+            # Ambiguidade do classificador: usar peso pequeno para não gerar falso positivo
+            ambiguity_boost = ambiguity * 0.10
+
+            # Confiança do classificador: alta confiança aumenta levemente o score (sinal mais confiável)
+            confidence_bonus = confidence * 0.20
+
             # Calcular score final (limitado a 1.0)
-            metrics['indecision_score'] = min(1.0, base_score + ambiguity_boost + confidence_penalty)
+            metrics['indecision_score'] = min(
+                1.0,
+                base_score + keyword_boost + ambiguity_boost + confidence_bonus,
+            )
         
         # ========================================================================
         # Probabilidade de postergação de decisão
@@ -1344,22 +1368,14 @@ class BERTAnalyzer:
         # ========================================================================
         # Score de linguagem condicional
         # ========================================================================
-        # Baseado em keywords condicionais detectadas e ambiguidade
+        # Baseado em keywords condicionais detectadas (sinais explícitos).
+        # Não usar ambiguidade do classificador aqui para evitar falsos positivos.
         if conditional_keywords:
             # Quanto mais keywords condicionais, maior o score
-            # Normalizado para máximo de 5 keywords (score máximo = 1.0)
-            keyword_score = min(1.0, len(conditional_keywords) / 5.0)
-            metrics['conditional_language_score'] = keyword_score
-        
-        # Alta ambiguidade também indica linguagem condicional
-        # Mesmo sem keywords explícitas, ambiguidade alta sugere linguagem condicional
-        ambiguity_score = ambiguity * 0.5
-        
-        # Usar o maior entre score de keywords e score de ambiguidade
-        metrics['conditional_language_score'] = max(
-            metrics['conditional_language_score'],
-            ambiguity_score
-        )
+            # Normalizado para máximo de 5 keywords (2 keywords ≈ 0.4)
+            metrics['conditional_language_score'] = min(1.0, len(conditional_keywords) / 5.0)
+        else:
+            metrics['conditional_language_score'] = 0.0
         
         return metrics
     

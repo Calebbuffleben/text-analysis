@@ -609,9 +609,7 @@ class TestSalesCategoryIntegration:
             assert result_without_marker['reformulation_marker_score'] == 0.0
             
             # solution_reformulation_signal não deve estar presente quando score é 0
-            if 'solution_reformulation_signal' in result_without_marker.get('sales_category_flags', {}):
-                # Se estiver presente, não deve ser False, mas não deve estar presente quando score é 0
-                pass  # A validação é que não deve estar presente
+            assert 'solution_reformulation_signal' not in result_without_marker.get('sales_category_flags', {})
             
         finally:
             if original_sbert is not None:
