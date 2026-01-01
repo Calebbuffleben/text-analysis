@@ -7,6 +7,7 @@ import socketio
 import structlog
 import base64
 import time
+import os
 from typing import Dict, Any
 from .config import Config
 from .types.messages import TranscriptionChunk, TextAnalysisResult, AudioChunk
@@ -19,10 +20,23 @@ logger = structlog.get_logger()
 # Inicializar serviços
 analysis_service = TextAnalysisService()
 transcription_service = TranscriptionService()
+
+# Buffer de áudio (tunable via env para facilitar testes manuais)
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
 audio_buffer_service = AudioBufferService(
-    min_duration_sec=5.0,  # Agrupar pelo menos 5 segundos de áudio (alinhado com backend)
-    max_duration_sec=10.0,  # Máximo 10 segundos antes de forçar transcrição
-    flush_interval_sec=2.0  # Flush após 2 segundos sem novos chunks
+    # Default 5s: bom equilíbrio para tempo real, mas pode cortar frases no meio.
+    # Para testes manuais, experimente 8-10s para reduzir truncamento de frases.
+    min_duration_sec=_env_float('AUDIO_BUFFER_MIN_DURATION_SEC', 5.0),
+    max_duration_sec=_env_float('AUDIO_BUFFER_MAX_DURATION_SEC', 10.0),
+    flush_interval_sec=_env_float('AUDIO_BUFFER_FLUSH_INTERVAL_SEC', 2.0),
 )
 
 # Configurar callback para quando buffer estiver pronto
