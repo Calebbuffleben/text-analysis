@@ -6,10 +6,18 @@ LABEL description="Text Analysis Service with BERT for Portuguese"
 LABEL version="1.0.0"
 
 # Instalar dependências do sistema
+# faster-whisper precisa de:
+# - ffmpeg (binário do sistema) para processar áudio
+# - build-essential para compilar ctranslate2 (dependência do faster-whisper)
+# - libffi-dev e libssl-dev para compilar algumas dependências Python
 RUN apt-get update && apt-get install -y \
     build-essential \
     curl \
     git \
+    ffmpeg \
+    libffi-dev \
+    libssl-dev \
+    pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
 # Diretório de trabalho

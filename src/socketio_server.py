@@ -19,7 +19,21 @@ logger = structlog.get_logger()
 
 # Inicializar serviços
 analysis_service = TextAnalysisService()
-transcription_service = TranscriptionService()
+
+# Inicializar TranscriptionService com tratamento de erro
+# Se faster-whisper não estiver disponível, o serviço ainda pode iniciar
+# mas a transcrição de áudio não funcionará
+try:
+    transcription_service = TranscriptionService()
+    logger.info("✅ [SOCKET.IO] TranscriptionService inicializado com sucesso")
+except Exception as e:
+    logger.error(
+        "❌ [CRITICAL] Falha ao inicializar TranscriptionService. Serviço continuará sem transcrição de áudio.",
+        error=str(e),
+        error_type=type(e).__name__,
+        note="O serviço Python continuará funcionando, mas transcrição de áudio estará desabilitada"
+    )
+    transcription_service = None  # type: ignore
 
 # Buffer de áudio (tunable via env para facilitar testes manuais)
 def _env_float(name: str, default: float) -> float:
@@ -51,6 +65,14 @@ async def on_buffer_ready(meeting_id: str, participant_id: str, track: str,
             track=track,
             audio_size_bytes=len(wav_data)
         )
+        
+        if transcription_service is None:
+            logger.warn(
+                "⚠️ [BUFFER] TranscriptionService não disponível, pulando transcrição",
+                meeting_id=meeting_id,
+                participant_id=participant_id
+            )
+            return
         
         transcription_result = await transcription_service.transcribe_audio(
             audio_data=wav_data,
@@ -481,6 +503,15 @@ async def audio_chunk(sid, data: Dict[str, Any]):
         )
         
         # Transcrever áudio combinado
+        if transcription_service is None:
+            logger.warn(
+                "⚠️ [FLUXO] TranscriptionService não disponível, pulando transcrição",
+                client_id=sid,
+                meeting_id=meeting_id,
+                participant_id=participant_id
+            )
+            return
+        
         try:
             transcription_result = await transcription_service.transcribe_audio(
                 audio_data=combined_wav,
