@@ -295,15 +295,11 @@ class TranscriptionService:
                 'condition_on_previous_text': False,  # Evitar repetições quando texto anterior é ruim
                 'compression_ratio_threshold': 2.4,  # Detectar e filtrar repetições
                 'log_prob_threshold': -1.0,  # Filtrar segmentos com baixa confiança (note: log_prob, não logprob)
-                'no_speech_threshold': 0.6,  # Filtrar segmentos sem fala
+                'no_speech_threshold': 0.3,  # Threshold mais baixo (mais permissivo) - padrão era 0.6
                 'beam_size': 5,  # Beam search size (padrão é 5)
-                'vad_filter': True,  # Filtrar silêncio usando VAD (Voice Activity Detection)
-                'vad_parameters': {
-                    'threshold': 0.5,  # Threshold para detecção de voz
-                    'min_speech_duration_ms': 250,  # Duração mínima de fala
-                    'max_speech_duration_s': float('inf'),  # Duração máxima
-                    'min_silence_duration_ms': 2000,  # Duração mínima de silêncio
-                }
+                # VAD desabilitado - estava removendo todo o áudio válido
+                # O VAD do faster-whisper pode ser muito agressivo com áudio de chamadas
+                'vad_filter': False,  # Desabilitar VAD para evitar remoção de áudio válido
             }
             
             audio_length_sec = len(audio_array) / sample_rate
