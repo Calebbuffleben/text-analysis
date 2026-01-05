@@ -30,8 +30,8 @@ cachetools==5.3.2
 # HTTP Client (para health checks)
 httpx==0.26.0
 
-# Transcrição de áudio (Whisper)
-openai-whisper==20231117
+# Transcrição de áudio (faster-whisper - implementação otimizada do Whisper)
+faster-whisper>=1.0.0
 ffmpeg-python==0.2.0
 scipy==1.11.4
 

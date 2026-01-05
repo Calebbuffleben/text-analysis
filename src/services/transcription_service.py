@@ -1,16 +1,21 @@
 """
-Serviço de transcrição de áudio usando Whisper.
+Serviço de transcrição de áudio usando faster-whisper.
 Recebe chunks de áudio WAV e retorna transcrições em texto.
+
+faster-whisper é uma implementação otimizada do Whisper que:
+- É mais rápida (até 4x mais rápida que openai-whisper)
+- Usa menos memória
+- Suporta os mesmos modelos (tiny, base, small, medium, large)
+- Funciona melhor em CPU com compute_type="int8"
 """
 
 import io
 import asyncio
 import time
 import structlog
-import whisper
-import torch
+from faster_whisper import WhisperModel
 import numpy as np
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from concurrent.futures import ThreadPoolExecutor
 from ..config import Config
 
@@ -19,15 +24,16 @@ logger = structlog.get_logger()
 
 class TranscriptionService:
     """
-    Serviço de transcrição de áudio usando Whisper.
+    Serviço de transcrição de áudio usando faster-whisper.
     
-    Whisper é um modelo de transcrição de áudio de código aberto da OpenAI,
-    otimizado para múltiplos idiomas incluindo português.
+    faster-whisper é uma implementação otimizada do Whisper da OpenAI,
+    otimizada para múltiplos idiomas incluindo português.
     
     Características:
     - Suporta múltiplos idiomas (português incluído)
     - Modelos leves disponíveis (tiny, base, small, medium, large)
     - Funciona em CPU e GPU
+    - Mais rápido e eficiente que openai-whisper
     - Lazy loading do modelo (carrega apenas quando necessário)
     """
     
@@ -43,20 +49,29 @@ class TranscriptionService:
         self.language = Config.WHISPER_LANGUAGE
         self.task = Config.WHISPER_TASK
         
-        # Log explícito do modelo que será usado
+        # faster-whisper compute_type: "int8" para CPU (mais rápido), "float16" para GPU
         import os
+        compute_type_env = os.getenv('WHISPER_COMPUTE_TYPE', '')
+        if compute_type_env:
+            self.compute_type = compute_type_env
+        else:
+            # Auto-detect: int8 para CPU, float16 para GPU
+            self.compute_type = "int8" if self.device == "cpu" else "float16"
+        
+        # Log explícito do modelo que será usado
         env_value = os.getenv('WHISPER_MODEL_NAME', 'NOT_SET')
         logger.info(
-            "🔍 [TRANSCRIÇÃO] Configuração do modelo Whisper",
+            "🔍 [TRANSCRIÇÃO] Configuração do modelo faster-whisper",
             env_var_WHISPER_MODEL_NAME=env_value,
             config_WHISPER_MODEL_NAME=self.model_name,
             device=self.device,
+            compute_type=self.compute_type,
             language=self.language,
-            note="Se model=base aparecer nos logs, verifique WHISPER_MODEL_NAME no Railway e reinicie o serviço"
+            note="faster-whisper é mais rápido que openai-whisper"
         )
         
         # Semáforo para limitar transcrições simultâneas
-        # Whisper é CPU-intensivo, então limitamos a 1 transcrição por vez
+        # faster-whisper é mais eficiente, mas ainda limitamos a 1 transcrição por vez
         # para evitar sobrecarga e garantir que cada transcrição tenha recursos completos
         try:
             self._transcription_semaphore = asyncio.Semaphore(1)
@@ -67,13 +82,13 @@ class TranscriptionService:
         
         # Duração mínima de áudio para transcrição (em segundos)
         # Chunks muito pequenos (< 0.5s) são ignorados pois:
-        # 1. Whisper funciona melhor com áudio mais longo
+        # 1. faster-whisper funciona melhor com áudio mais longo
         # 2. Reduz carga desnecessária no CPU
         # 3. Melhora qualidade da transcrição
         self._min_audio_duration_sec = 0.5
         
-        # ThreadPoolExecutor para executar Whisper em thread separada
-        # Whisper é CPU-intensivo e bloqueante, então executamos em thread separada
+        # ThreadPoolExecutor para executar faster-whisper em thread separada
+        # faster-whisper é mais rápido mas ainda bloqueante, então executamos em thread separada
         # para não bloquear o event loop do asyncio
         self._executor = ThreadPoolExecutor(max_workers=1)
         
@@ -88,7 +103,7 @@ class TranscriptionService:
     
     def _load_model(self):
         """
-        Carrega modelo Whisper (lazy loading).
+        Carrega modelo faster-whisper (lazy loading).
         
         Modelos disponíveis (do menor ao maior):
         - tiny: ~39M parâmetros, mais rápido, menos preciso
@@ -99,51 +114,75 @@ class TranscriptionService:
         
         O modelo escolhido (base por padrão) oferece bom equilíbrio
         entre velocidade e precisão para transcrições em tempo real.
+        
+        faster-whisper é mais rápido que openai-whisper, especialmente em CPU
+        com compute_type="int8".
         """
         if self._loaded:
-            logger.debug("Modelo Whisper já carregado", model=self.model_name)
+            logger.debug("Modelo faster-whisper já carregado", model=self.model_name)
             return
         
         logger.info(
-            "🔄 [TRANSCRIÇÃO] Carregando modelo Whisper",
+            "🔄 [TRANSCRIÇÃO] Carregando modelo faster-whisper",
             model=self.model_name,
-            device=self.device
+            device=self.device,
+            compute_type=self.compute_type
         )
         
         load_start = time.perf_counter()
         
         try:
-            # Whisper detecta automaticamente se CUDA está disponível
-            # mas podemos forçar device se necessário
+            # faster-whisper aceita "cpu" ou "cuda" diretamente
+            # Ele mesmo verifica se CUDA está disponível, então não precisamos verificar manualmente
             device = self.device
-            if device == "cuda" and not torch.cuda.is_available():
-                logger.warn("CUDA requested but not available, using CPU")
-                device = "cpu"
+            compute_type = self.compute_type
             
-            # Carregar modelo Whisper
+            # Tentar carregar modelo faster-whisper
             # O modelo será baixado automaticamente na primeira execução
             # e armazenado em cache para uso futuro
-            self.model = whisper.load_model(
-                self.model_name,
-                device=device
-            )
+            try:
+                self.model = WhisperModel(
+                    self.model_name,
+                    device=device,
+                    compute_type=compute_type
+                )
+            except (RuntimeError, ValueError) as cuda_error:
+                # Se CUDA não estiver disponível ou houver erro, tentar com CPU
+                if device == "cuda":
+                    logger.warn(
+                        "CUDA requested but not available, falling back to CPU",
+                        error=str(cuda_error)
+                    )
+                    device = "cpu"
+                    compute_type = "int8"
+                    self.compute_type = "int8"
+                    # Tentar novamente com CPU
+                    self.model = WhisperModel(
+                        self.model_name,
+                        device=device,
+                        compute_type=compute_type
+                    )
+                else:
+                    # Re-raise se não for problema de CUDA
+                    raise
             
             self._loaded = True
             load_latency_ms = (time.perf_counter() - load_start) * 1000
             
             logger.info(
-                "✅ [TRANSCRIÇÃO] Modelo Whisper carregado com sucesso",
+                "✅ [TRANSCRIÇÃO] Modelo faster-whisper carregado com sucesso",
                 model=self.model_name,
                 device=device,
+                compute_type=self.compute_type,
                 language=self.language,
                 load_time_ms=round(load_latency_ms, 2),
-                warning="Se model=base, configure WHISPER_MODEL_NAME=tiny no Railway e reinicie"
+                note="faster-whisper é mais rápido que openai-whisper"
             )
             
         except Exception as e:
             load_latency_ms = (time.perf_counter() - load_start) * 1000
             logger.error(
-                "❌ [TRANSCRIÇÃO] Falha ao carregar modelo Whisper",
+                "❌ [TRANSCRIÇÃO] Falha ao carregar modelo faster-whisper",
                 error=str(e),
                 error_type=type(e).__name__,
                 model=self.model_name,
@@ -247,23 +286,25 @@ class TranscriptionService:
                 audio_length_sec=round(len(audio_array) / sample_rate, 2)
             )
             
-            # Configurar parâmetros de transcrição
-            # Melhorar qualidade: usar temperature=0 para mais precisão, condition_on_previous_text=False para evitar repetições
+            # Configurar parâmetros de transcrição para faster-whisper
+            # faster-whisper tem parâmetros ligeiramente diferentes
             transcribe_options = {
                 'language': language or self.language,
                 'task': self.task,  # 'transcribe' ou 'translate'
-                'fp16': False,  # Usar float32 em CPU
-                'verbose': False,  # Não imprimir logs detalhados
                 'temperature': 0.0,  # Temperatura 0 = mais determinístico e preciso
                 'condition_on_previous_text': False,  # Evitar repetições quando texto anterior é ruim
                 'compression_ratio_threshold': 2.4,  # Detectar e filtrar repetições
-                'logprob_threshold': -1.0,  # Filtrar segmentos com baixa confiança
-                'no_speech_threshold': 0.6  # Filtrar segmentos sem fala
+                'log_prob_threshold': -1.0,  # Filtrar segmentos com baixa confiança (note: log_prob, não logprob)
+                'no_speech_threshold': 0.6,  # Filtrar segmentos sem fala
+                'beam_size': 5,  # Beam search size (padrão é 5)
+                'vad_filter': True,  # Filtrar silêncio usando VAD (Voice Activity Detection)
+                'vad_parameters': {
+                    'threshold': 0.5,  # Threshold para detecção de voz
+                    'min_speech_duration_ms': 250,  # Duração mínima de fala
+                    'max_speech_duration_s': float('inf'),  # Duração máxima
+                    'min_silence_duration_ms': 2000,  # Duração mínima de silêncio
+                }
             }
-            
-            # Se CUDA estiver disponível, usar fp16 para melhor performance
-            if self.device == "cuda" and torch.cuda.is_available():
-                transcribe_options['fp16'] = True
             
             audio_length_sec = len(audio_array) / sample_rate
             logger.info(
@@ -303,7 +344,7 @@ class TranscriptionService:
                 try:
                     # Verificar se modelo está carregado
                     if self.model is None:
-                        logger.error("❌ [TRANSCRIÇÃO] Modelo Whisper não está carregado!")
+                        logger.error("❌ [TRANSCRIÇÃO] Modelo faster-whisper não está carregado!")
                         return {
                             'text': '',
                             'language': language or self.language,
@@ -312,34 +353,66 @@ class TranscriptionService:
                         }
                     
                     logger.info(
-                        "⏳ [TRANSCRIÇÃO] Chamando Whisper model.transcribe",
+                        "⏳ [TRANSCRIÇÃO] Chamando faster-whisper model.transcribe",
                         active_transcriptions=self._active_transcriptions,
                         audio_samples=len(audio_array),
                         audio_length_sec=round(len(audio_array) / sample_rate, 2),
                         model=self.model_name,
+                        compute_type=self.compute_type,
                         timeout_sec=30.0
                     )
                     
                     # Criar função de transcrição para o executor
+                    # faster-whisper retorna (segments, info) ao invés de dict
                     model_ref = self.model
                     audio_ref = audio_array.copy()
                     options_ref = transcribe_options.copy()
+                    language_ref = language or self.language  # Capturar language no closure
                     
                     def transcribe_sync():
                         try:
-                            return model_ref.transcribe(audio_ref, **options_ref)
+                            # faster-whisper retorna (segments, info)
+                            # segments é um iterador de objetos Segment
+                            segments, info = model_ref.transcribe(audio_ref, **options_ref)
+                            
+                            # Converter segments para lista e processar
+                            segments_list = list(segments)
+                            
+                            # Construir texto completo concatenando segmentos
+                            text = " ".join(seg.text for seg in segments_list)
+                            
+                            # Converter segments para formato dict compatível
+                            segments_dict = []
+                            for seg in segments_list:
+                                segments_dict.append({
+                                    'start': seg.start,
+                                    'end': seg.end,
+                                    'text': seg.text,
+                                    'no_speech_prob': getattr(seg, 'no_speech_prob', 0.0),
+                                    'compression_ratio': getattr(seg, 'compression_ratio', 0.0),
+                                    'avg_logprob': getattr(seg, 'avg_logprob', 0.0),
+                                })
+                            
+                            # Retornar formato compatível com openai-whisper
+                            return {
+                                'text': text,
+                                'language': info.language if hasattr(info, 'language') else language_ref,
+                                'language_probability': getattr(info, 'language_probability', 1.0),
+                                'segments': segments_dict,
+                                'duration': getattr(info, 'duration', len(audio_ref) / sample_rate)
+                            }
                         except Exception as e:
                             logger.error(f"Erro dentro do transcribe_sync: {e}")
                             raise
                     
                     # Adicionar timeout de 30 segundos
-                    # Whisper tiny deve ser rápido (< 5s para 3s de áudio), mas base pode levar ~20-25s
+                    # faster-whisper é mais rápido: tiny < 2s, base < 5s, small < 10s para 8s de áudio
                     task = loop.run_in_executor(self._executor, transcribe_sync)
                     result = await asyncio.wait_for(task, timeout=30.0)
                     transcribe_latency_ms = (time.perf_counter() - transcribe_start) * 1000
                     
                     logger.info(
-                        "✅ [TRANSCRIÇÃO] Whisper retornou resultado",
+                        "✅ [TRANSCRIÇÃO] faster-whisper retornou resultado",
                         latency_ms=round(transcribe_latency_ms, 2),
                         result_type=type(result).__name__,
                         has_text='text' in result if isinstance(result, dict) else False
@@ -356,7 +429,7 @@ class TranscriptionService:
                 except Exception as executor_error:
                     transcribe_latency_ms = (time.perf_counter() - transcribe_start) * 1000
                     logger.error(
-                        "❌ [TRANSCRIÇÃO] Erro no executor do Whisper",
+                        "❌ [TRANSCRIÇÃO] Erro no executor do faster-whisper",
                         error=str(executor_error),
                         error_type=type(executor_error).__name__,
                         latency_ms=round(transcribe_latency_ms, 2)
