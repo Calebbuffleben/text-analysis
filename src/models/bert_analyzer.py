@@ -1335,7 +1335,7 @@ class BERTAnalyzer:
         # Isso reduz falsos positivos quando a classificação está "por um fio".
         if category in ['stalling', 'objection_soft'] and intensity < 0.35:
             return metrics
-
+        
         # ========================================================================
         # Score geral de indecisão
         # ========================================================================
@@ -1355,10 +1355,10 @@ class BERTAnalyzer:
 
             # Ambiguidade do classificador: usar peso pequeno para não gerar falso positivo
             ambiguity_boost = ambiguity * 0.10
-
+            
             # Confiança do classificador: alta confiança aumenta levemente o score (sinal mais confiável)
             confidence_bonus = confidence * 0.20
-
+            
             # Calcular score final (limitado a 1.0)
             metrics['indecision_score'] = min(
                 1.0,

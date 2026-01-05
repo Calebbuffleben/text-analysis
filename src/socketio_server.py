@@ -703,14 +703,16 @@ async def audio_chunk(sid, data: Dict[str, Any]):
 async def ping(sid, data: Dict[str, Any]):
     """
     Health check ping/pong.
-    
+
     Args:
         sid: Session ID do cliente
         data: Dados do ping (opcional)
     """
+    logger.info("🏓 Received ping from client", client_id=sid, timestamp=data.get('timestamp'))
     await sio.emit('pong', {
         'timestamp': data.get('timestamp'),
-        'service': 'text-analysis'
+        'service': 'text-analysis',
+        'server_time': time.time()
     }, room=sid)
 
 

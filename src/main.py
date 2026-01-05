@@ -102,14 +102,30 @@ logger.info("✅ [SISTEMA] Serviços criados com sucesso")
 async def health():
     """
     Health check endpoint.
-    
+
     Returns:
         JSON com status do serviço
     """
+    # Verificar se os serviços estão inicializados
+    services_status = {
+        "analysis_service": "ok" if analysis_service else "error",
+        "transcription_service": "ok" if 'transcription_service' in globals() and transcription_service else "error"
+    }
+
+    # Verificar se há clientes Socket.IO conectados
+    from .socketio_server import sio
+    connected_clients = len(sio.manager.rooms.get('/', set()) - {None}) if sio.manager else 0
+
     return JSONResponse({
         "status": "ok",
         "service": "text-analysis",
-        "version": "1.0.0"
+        "version": "1.0.0",
+        "services": services_status,
+        "socketio": {
+            "connected_clients": connected_clients,
+            "server_running": True
+        },
+        "timestamp": time.time()
     })
 
 
