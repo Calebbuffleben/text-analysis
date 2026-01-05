@@ -176,16 +176,28 @@ async def disconnect(sid):
 @sio.on('*')
 async def catch_all(event, sid, data):
     """Handler genérico para capturar todos os eventos Socket.IO"""
-    # Não logar eventos de sistema (connect, disconnect)
-    if event not in ['connect', 'disconnect']:
-        logger.info(
-            "👂 [DIAGNÓSTICO] Evento Socket.IO recebido",
-            event=event,
-            client_id=sid,
-            data_type=type(data).__name__,
-            data_keys=list(data.keys()) if isinstance(data, dict) else 'not_dict'
-        )
+    # Logar TODOS os eventos, incluindo audio_chunk
+    logger.info(
+        "👂 [DIAGNÓSTICO] Evento Socket.IO recebido (catch-all)",
+        event=event,
+        client_id=sid,
+        data_type=type(data).__name__,
+        data_keys=list(data.keys()) if isinstance(data, dict) else 'not_dict',
+        has_audio_data='audioData' in data if isinstance(data, dict) else False,
+        audio_data_size=len(str(data.get('audioData', ''))) if isinstance(data, dict) else 0
+    )
     print(f"[DIAGNÓSTICO] Evento genérico: {event}, sid={sid}, data={type(data)}")
+    
+    # Se for audio_chunk, logar detalhes adicionais
+    if event == 'audio_chunk' and isinstance(data, dict):
+        logger.critical(
+            "🔴 [DIAGNÓSTICO] audio_chunk recebido via catch-all!",
+            client_id=sid,
+            meeting_id=data.get('meetingId'),
+            participant_id=data.get('participantId'),
+            audio_data_type=type(data.get('audioData')).__name__,
+            audio_data_size=len(str(data.get('audioData', '')))
+        )
 
 # Criar app ASGI
 app = socketio.ASGIApp(sio)
@@ -385,13 +397,14 @@ async def audio_chunk(sid, data: Dict[str, Any]):
             }
     """
     # DIAGNÓSTICO: Log imediato no início do handler
-    print(f"[DIAGNÓSTICO] audio_chunk chamado! sid={sid}, data_keys={list(data.keys()) if data else 'None'}")
-    logger.info(
-        "🔴 [DIAGNÓSTICO] Handler audio_chunk INICIADO",
+    print(f"[DIAGNÓSTICO] audio_chunk handler CHAMADO! sid={sid}, data_keys={list(data.keys()) if data else 'None'}")
+    logger.critical(
+        "🔴 [DIAGNÓSTICO] Handler audio_chunk INICIADO (handler específico)",
         client_id=sid,
         data_type=type(data).__name__,
         data_keys=list(data.keys()) if isinstance(data, dict) else 'not_dict',
-        has_meeting_id='meetingId' in data if isinstance(data, dict) else False
+        has_meeting_id='meetingId' in data if isinstance(data, dict) else False,
+        has_audio_data='audioData' in data if isinstance(data, dict) else False
     )
     
     try:
