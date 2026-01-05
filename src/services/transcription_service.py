@@ -248,11 +248,17 @@ class TranscriptionService:
             )
             
             # Configurar parâmetros de transcrição
+            # Melhorar qualidade: usar temperature=0 para mais precisão, condition_on_previous_text=False para evitar repetições
             transcribe_options = {
                 'language': language or self.language,
                 'task': self.task,  # 'transcribe' ou 'translate'
                 'fp16': False,  # Usar float32 em CPU
-                'verbose': False  # Não imprimir logs detalhados
+                'verbose': False,  # Não imprimir logs detalhados
+                'temperature': 0.0,  # Temperatura 0 = mais determinístico e preciso
+                'condition_on_previous_text': False,  # Evitar repetições quando texto anterior é ruim
+                'compression_ratio_threshold': 2.4,  # Detectar e filtrar repetições
+                'logprob_threshold': -1.0,  # Filtrar segmentos com baixa confiança
+                'no_speech_threshold': 0.6  # Filtrar segmentos sem fala
             }
             
             # Se CUDA estiver disponível, usar fp16 para melhor performance
@@ -391,14 +397,39 @@ class TranscriptionService:
                     speech_probs = [1.0 - conf for conf in confidences]
                     confidence = float(np.mean(speech_probs)) if speech_probs else 0.0
             
+            # Detectar repetições no texto (problema comum com áudio ruim)
+            text_words = text.split()
+            unique_words = set(text_words)
+            repetition_ratio = 1.0 - (len(unique_words) / len(text_words)) if text_words else 0.0
+            has_repetition = repetition_ratio > 0.3  # Mais de 30% de repetição
+            
+            # Log detalhado dos segmentos para diagnóstico
+            segment_previews = []
+            if segments:
+                for i, seg in enumerate(segments[:3]):  # Primeiros 3 segmentos
+                    seg_text = seg.get('text', '').strip()
+                    seg_no_speech = seg.get('no_speech_prob', 0.0)
+                    segment_previews.append({
+                        'index': i,
+                        'text_preview': seg_text[:30] if seg_text else '',
+                        'no_speech_prob': round(seg_no_speech, 2),
+                        'start': round(seg.get('start', 0), 2),
+                        'end': round(seg.get('end', 0), 2)
+                    })
+            
             logger.info(
                 "✅ [TRANSCRIÇÃO] Transcrição concluída",
                 text_length=len(text),
-                text_preview=text[:50] if text else '',
+                text_preview=text[:100] if text else '',  # Aumentar preview para 100 chars
+                text_full=text if len(text) <= 200 else text[:200] + '...',  # Texto completo se curto
                 language=detected_language,
                 confidence=round(confidence, 3),
                 segments_count=len(segments),
-                latency_ms=round(transcribe_latency_ms, 2)
+                repetition_ratio=round(repetition_ratio, 2),
+                has_repetition=has_repetition,
+                segment_previews=segment_previews,
+                latency_ms=round(transcribe_latency_ms, 2),
+                warning="Repetição detectada" if has_repetition else None
             )
             
             return {
