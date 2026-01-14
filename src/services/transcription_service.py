@@ -293,10 +293,10 @@ class TranscriptionService:
                 'task': self.task,  # 'transcribe' ou 'translate'
                 'temperature': 0.0,  # Temperatura 0 = mais determinístico e preciso
                 'condition_on_previous_text': False,  # Evitar repetições quando texto anterior é ruim
-                'compression_ratio_threshold': 2.4,  # Detectar e filtrar repetições
-                'log_prob_threshold': -1.0,  # Filtrar segmentos com baixa confiança (note: log_prob, não logprob)
+                'compression_ratio_threshold': 2.0,  # Detectar e filtrar repetições (reduzido de 2.4 para 2.0 para filtrar mais repetições)
+                'log_prob_threshold': -0.8,  # Filtrar segmentos com baixa confiança (aumentado de -1.0 para -0.8 para filtrar mais segmentos ruins)
                 'no_speech_threshold': 0.3,  # Threshold mais baixo (mais permissivo) - padrão era 0.6
-                'beam_size': 5,  # Beam search size (padrão é 5)
+                'beam_size': 7,  # Beam search size (aumentado de 5 para 7 para maior precisão)
                 # VAD desabilitado - estava removendo todo o áudio válido
                 # O VAD do faster-whisper pode ser muito agressivo com áudio de chamadas
                 'vad_filter': False,  # Desabilitar VAD para evitar remoção de áudio válido
