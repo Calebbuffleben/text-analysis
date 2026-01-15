@@ -408,7 +408,7 @@ class TextAnalysisService:
                 # - flags: Dict[str, bool] (flags semânticas booleanas)
                 categoria, confianca, scores, ambiguidade, intensidade, flags = analyzer.classify_sales_category(
                     chunk.text,
-                    min_confidence=0.3  # Threshold mínimo de confiança (30%)
+                    min_confidence=0.15  # Threshold mínimo de confiança (15%) - reduzido de 0.3 para permitir mais classificações
                 )
                 
                 # Armazenar resultados
@@ -450,7 +450,7 @@ class TextAnalysisService:
                     best_score = max(scores.values()) if scores else 0.0
                     reasoning = {
                         "why": "No category met minimum confidence threshold",
-                        "reason": f"Best score {round(best_score, 2)} < {0.3}",
+                        "reason": f"Best score {round(best_score, 2)} < {0.15}",
                         "ambiguity_reason": f"Ambiguity: {round(ambiguidade, 2)}" if ambiguidade else "N/A"
                     }
                     
@@ -460,7 +460,7 @@ class TextAnalysisService:
                         best_score=round(best_score, 4),
                         ambiguity=round(ambiguidade, 4) if ambiguidade else None,
                         intensity=round(intensidade, 4) if intensidade else None,
-                        min_confidence=0.3,
+                        min_confidence=0.15,
                         reasoning=reasoning
                     )
         except Exception as e:
