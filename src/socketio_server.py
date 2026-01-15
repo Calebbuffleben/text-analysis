@@ -140,8 +140,11 @@ audio_buffer_service.set_callback(on_buffer_ready)
 
 # Criar servidor Socket.IO
 # Configurações para melhor compatibilidade com Railway e polling HTTP
+# Configurar CORS: aceitar '*' ou lista de origens
+_cors_origins = '*' if (len(Config.SOCKETIO_CORS_ORIGINS) == 1 and Config.SOCKETIO_CORS_ORIGINS[0] == '*') else Config.SOCKETIO_CORS_ORIGINS
+
 sio = socketio.AsyncServer(
-    cors_allowed_origins=Config.SOCKETIO_CORS_ORIGINS,
+    cors_allowed_origins=_cors_origins,
     async_mode='asgi',
     logger=False,  # Usar structlog ao invés do logger padrão
     engineio_logger=False,
@@ -152,52 +155,13 @@ sio = socketio.AsyncServer(
     ping_interval=25,
     # Permitir polling HTTP (necessário para alguns ambientes)
     transports=['polling', 'websocket'],
+    # Configurações adicionais para garantir conectividade
+    always_connect=False,
+    http_compression=True,
 )
 
-# Handlers de conexão
-@sio.event
-async def connect(sid, environ):
-    """Handler chamado quando cliente conecta"""
-    logger.info(
-        "✅ [SOCKET.IO] Cliente conectado",
-        client_id=sid,
-        remote_addr=environ.get('REMOTE_ADDR', 'unknown')
-    )
-
-@sio.event
-async def disconnect(sid):
-    """Handler chamado quando cliente desconecta"""
-    logger.info(
-        "❌ [SOCKET.IO] Cliente desconectado",
-        client_id=sid
-    )
-
-# DIAGNÓSTICO: Registrar handler genérico para capturar todos os eventos
-@sio.on('*')
-async def catch_all(event, sid, data):
-    """Handler genérico para capturar todos os eventos Socket.IO"""
-    # Logar TODOS os eventos, incluindo audio_chunk
-    logger.info(
-        "👂 [DIAGNÓSTICO] Evento Socket.IO recebido (catch-all)",
-        event=event,
-        client_id=sid,
-        data_type=type(data).__name__,
-        data_keys=list(data.keys()) if isinstance(data, dict) else 'not_dict',
-        has_audio_data='audioData' in data if isinstance(data, dict) else False,
-        audio_data_size=len(str(data.get('audioData', ''))) if isinstance(data, dict) else 0
-    )
-    print(f"[DIAGNÓSTICO] Evento genérico: {event}, sid={sid}, data={type(data)}")
-    
-    # Se for audio_chunk, logar detalhes adicionais
-    if event == 'audio_chunk' and isinstance(data, dict):
-        logger.critical(
-            "🔴 [DIAGNÓSTICO] audio_chunk recebido via catch-all!",
-            client_id=sid,
-            meeting_id=data.get('meetingId'),
-            participant_id=data.get('participantId'),
-            audio_data_type=type(data.get('audioData')).__name__,
-            audio_data_size=len(str(data.get('audioData', '')))
-        )
+# Nota: Handler catch-all removido para evitar interferência com eventos internos do Socket.IO
+# Handlers específicos estão registrados abaixo após criação do app
 
 # Criar app ASGI
 app = socketio.ASGIApp(sio)
@@ -708,12 +672,13 @@ async def ping(sid, data: Dict[str, Any]):
         sid: Session ID do cliente
         data: Dados do ping (opcional)
     """
-    logger.info("🏓 Received ping from client", client_id=sid, timestamp=data.get('timestamp'))
+    logger.debug("🏓 Received ping from client", client_id=sid, timestamp=data.get('timestamp'))
     await sio.emit('pong', {
         'timestamp': data.get('timestamp'),
         'service': 'text-analysis',
         'server_time': time.time()
     }, room=sid)
+    logger.debug("🏓 Sent pong to client", client_id=sid, timestamp=data.get('timestamp'))
 
 
 @sio.event
@@ -722,6 +687,11 @@ async def health_ping(sid, data: Dict[str, Any]):
     Health check ping/pong (custom event names to avoid any collision with
     Socket.IO / Engine.IO internal heartbeat packets).
     """
+    logger.debug(
+        "🏓 Received health_ping from client",
+        client_id=sid,
+        timestamp=data.get('timestamp')
+    )
     await sio.emit(
         'health_pong',
         {
@@ -729,5 +699,10 @@ async def health_ping(sid, data: Dict[str, Any]):
             'service': 'text-analysis'
         },
         room=sid
+    )
+    logger.debug(
+        "🏓 Sent health_pong to client",
+        client_id=sid,
+        timestamp=data.get('timestamp')
     )
 
