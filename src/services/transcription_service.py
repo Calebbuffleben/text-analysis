@@ -248,6 +248,19 @@ class TranscriptionService:
                 expected_sample_rate=sample_rate
             )
             
+            # Validar sample_rate antes de usar
+            if sample_rate <= 0:
+                logger.warn(
+                    "⚠️ [TRANSCRIÇÃO] Sample rate inválido",
+                    sample_rate=sample_rate
+                )
+                return {
+                    'text': '',
+                    'language': language or self.language,
+                    'segments': [],
+                    'confidence': 0.0
+                }
+            
             # Decodificar WAV para array numpy
             # O Whisper espera áudio como array numpy float32 normalizado (-1 a 1)
             audio_array = self._decode_wav(audio_data, sample_rate)
@@ -395,17 +408,21 @@ class TranscriptionService:
                 active_transcriptions=self._active_transcriptions
             )
             
+            # Inicializar variáveis de latência no início para garantir que estão definidas
+            transcribe_start = time.perf_counter()
+            transcribe_latency_ms = 0.0
+            
             # Adquirir semáforo ANTES de qualquer processamento
             # Isso garante que apenas uma transcrição por vez seja processada
             async with self._transcription_semaphore:
                 self._active_transcriptions += 1
-                transcribe_start = time.perf_counter()
                 result = None
                 
                 try:
                     # Verificar se modelo está carregado
                     if self.model is None:
                         logger.error("❌ [TRANSCRIÇÃO] Modelo faster-whisper não está carregado!")
+                        transcribe_latency_ms = (time.perf_counter() - transcribe_start) * 1000
                         return {
                             'text': '',
                             'language': language or self.language,
@@ -684,7 +701,13 @@ class TranscriptionService:
                 
                 # Converter estéreo para mono (média dos canais)
                 if num_channels == 2:
-                    audio_float = audio_float.reshape(-1, 2).mean(axis=1)
+                    # Garantir que o array tenha número par de samples para reshape
+                    if len(audio_float) % 2 != 0:
+                        # Se ímpar, remover último sample para permitir reshape
+                        audio_float = audio_float[:-1]
+                    if len(audio_float) >= 2:
+                        audio_float = audio_float.reshape(-1, 2).mean(axis=1)
+                    # Se após remoção ficou muito curto (< 2), manter como está (tratar como mono)
                 
                 # Resample se necessário (Whisper funciona melhor com 16kHz)
                 # Nota: Se o áudio já estiver em 16kHz, não precisa resample
@@ -737,6 +760,11 @@ class TranscriptionService:
         if len(audio_array) == 0:
             return False
         
+        # Validar sample_rate antes de usar
+        if sample_rate <= 0:
+            logger.warn("⚠️ [PRÉ-PROCESSAMENTO] Sample rate inválido para detecção RMS", sample_rate=sample_rate)
+            return False
+        
         # Converter threshold dB para linear (RMS)
         # dB = 20 * log10(RMS)
         # RMS = 10^(dB/20)
@@ -748,8 +776,10 @@ class TranscriptionService:
             window_samples = 1
         
         # Calcular RMS em janelas sobrepostas
+        # Garantir que step_size nunca seja 0 (proteger contra window_samples = 1)
+        step_size = max(1, window_samples // 2)  # Overlap de 50%, mínimo 1
         max_rms = 0.0
-        for i in range(0, len(audio_array), window_samples // 2):  # Overlap de 50%
+        for i in range(0, len(audio_array), step_size):
             window = audio_array[i:i + window_samples]
             if len(window) == 0:
                 break
@@ -790,6 +820,11 @@ class TranscriptionService:
             Tuple (audio_trimmed, info_dict) onde info_dict contém estatísticas do trim
         """
         if len(audio_array) == 0:
+            return audio_array, {'trimmed_start_sec': 0.0, 'trimmed_end_sec': 0.0, 'original_length_sec': 0.0}
+        
+        # Validar sample_rate antes de usar
+        if sample_rate <= 0:
+            logger.warn("⚠️ [PRÉ-PROCESSAMENTO] Sample rate inválido para trim", sample_rate=sample_rate)
             return audio_array, {'trimmed_start_sec': 0.0, 'trimmed_end_sec': 0.0, 'original_length_sec': 0.0}
         
         original_length = len(audio_array)
@@ -880,6 +915,10 @@ class TranscriptionService:
         """
         if len(audio_array) == 0:
             return -999.0  # SNR muito baixo (inválido)
+        
+        # Validar sample_rate antes de usar
+        if sample_rate <= 0:
+            return -999.0  # SNR inválido
         
         frame_samples = int(sample_rate * frame_length_ms / 1000.0)
         if frame_samples < 1:
