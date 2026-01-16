@@ -12,6 +12,7 @@ faster-whisper é uma implementação otimizada do Whisper que:
 import io
 import asyncio
 import time
+import re
 import structlog
 from faster_whisper import WhisperModel
 import numpy as np
@@ -286,10 +287,11 @@ class TranscriptionService:
             
             # Verificar se pré-processamento foi bem-sucedido
             if preprocess_result is None:
-                logger.debug(
+                logger.warn(
                     "⏭️ [TRANSCRIÇÃO] Pré-processamento rejeitou áudio (validação falhou)",
                     audio_size_bytes=len(audio_data),
-                    sample_rate=sample_rate
+                    sample_rate=sample_rate,
+                    reason="preprocess_result is None - possible causes: decode failed, no speech detected, audio too short after trim"
                 )
                 return {
                     'text': '',
@@ -409,6 +411,9 @@ class TranscriptionService:
                             # Construir texto completo concatenando apenas segmentos filtrados
                             text = " ".join(seg.text for seg in filtered_segments).strip()
                             
+                            # FASE 3: Aplicar pós-processamento para corrigir erros comuns de transcrição
+                            text = self._fix_common_transcription_errors(text)
+                            
                             # Log de filtragem para diagnóstico
                             if filtered_count > 0:
                                 logger.debug(
@@ -482,6 +487,11 @@ class TranscriptionService:
             
             # Verificar se result foi definido
             if result is None:
+                logger.warn(
+                    "⚠️ [TRANSCRIÇÃO] Resultado da transcrição é None",
+                    audio_length_sec=round(audio_duration_sec_after_trim, 2),
+                    reason="transcribe_sync() retornou None - possible causes: exception during transcription, timeout, or model failure"
+                )
                 return {
                     'text': '',
                     'language': language or self.language,
@@ -490,9 +500,26 @@ class TranscriptionService:
                 }
             
             # Extrair informações relevantes
-            text = result.get('text', '').strip()
+            text_raw = result.get('text', '')
+            text = text_raw.strip()
             detected_language = result.get('language', language or self.language)
             segments = result.get('segments', [])
+            
+            # Log detalhado quando texto é extraído mas está vazio
+            if not text and text_raw:
+                logger.warn(
+                    "⚠️ [TRANSCRIÇÃO] Texto extraído está vazio após strip()",
+                    text_raw_length=len(text_raw),
+                    text_raw_preview=text_raw[:50],
+                    segments_count=len(segments),
+                    reason="Whisper retornou texto não-vazio mas strip() resultou em string vazia (apenas espaços/tabs/newlines)"
+                )
+            elif not text:
+                logger.warn(
+                    "⚠️ [TRANSCRIÇÃO] Texto extraído está vazio (text_raw também vazio)",
+                    segments_count=len(segments),
+                    reason="Whisper não detectou nenhum texto transcrito - possible causes: silence only, audio too short, low quality"
+                )
             
             # Calcular confiança média dos segmentos (após filtro P3.1)
             confidence = 0.0
@@ -514,20 +541,39 @@ class TranscriptionService:
             has_repetition = repetition_ratio > 0.3  # Mais de 30% de repetição
             
             # P3.2: Validar texto agregado antes de retornar
-            # Se confidence muito baixa ou repetição muito alta, retornar texto vazio
-            # Isso evita propagar alucinações quando a qualidade não permite transcrição confiável
-            min_confidence = 0.3  # Confidence mínima aceitável
+            # REVISADO: Reduzir min_confidence de 0.3 para 0.15 para permitir transcrições válidas com baixa confiança
+            # Repetition ratio mantido em 0.5 para evitar alucinações repetitivas
+            min_confidence = 0.15  # Confidence mínima aceitável (reduzido de 0.3 para 0.15)
             max_repetition_ratio = 0.5  # Repetition ratio máximo aceitável (50%)
+            
+            # Log detalhado antes da validação
+            logger.debug(
+                "🔍 [TRANSCRIÇÃO] Validando qualidade do texto transcrito",
+                text_length=len(text),
+                text_preview=text[:50] if text else '',
+                confidence=round(confidence, 3),
+                min_confidence=min_confidence,
+                repetition_ratio=round(repetition_ratio, 3),
+                max_repetition_ratio=max_repetition_ratio,
+                segments_count=len(segments),
+                will_pass_confidence=confidence >= min_confidence,
+                will_pass_repetition=repetition_ratio <= max_repetition_ratio
+            )
             
             if confidence < min_confidence or repetition_ratio > max_repetition_ratio:
                 logger.warn(
                     "⚠️ [TRANSCRIÇÃO] Texto rejeitado por baixa qualidade",
                     confidence=round(confidence, 3),
                     min_confidence=min_confidence,
+                    confidence_gap=round(min_confidence - confidence, 3) if confidence < min_confidence else 0,
                     repetition_ratio=round(repetition_ratio, 3),
                     max_repetition_ratio=max_repetition_ratio,
-                    text_preview=text[:50] if text else '',
-                    reason='low_confidence' if confidence < min_confidence else 'high_repetition'
+                    repetition_excess=round(repetition_ratio - max_repetition_ratio, 3) if repetition_ratio > max_repetition_ratio else 0,
+                    text_preview=text[:100] if text else '',
+                    text_full=text if len(text) <= 200 else text[:200] + '...',
+                    segments_count=len(segments),
+                    reason='low_confidence' if confidence < min_confidence else 'high_repetition',
+                    note="min_confidence reduzido de 0.3 para 0.15 para permitir transcrições válidas com baixa confiança"
                 )
                 return {
                     'text': '',  # Retornar texto vazio em vez de alucinações
@@ -935,27 +981,55 @@ class TranscriptionService:
             audio_array = self._decode_wav(audio_data, sample_rate)
             
             if audio_array is None or len(audio_array) == 0:
+                logger.warn(
+                    "⚠️ [PRÉ-PROCESSAMENTO] Falha na decodificação WAV ou áudio vazio",
+                    audio_size_bytes=len(audio_data),
+                    sample_rate=sample_rate,
+                    reason="decode_wav retornou None ou array vazio"
+                )
                 return None
             
             # Filtrar chunks muito pequenos
             audio_duration_sec = len(audio_array) / sample_rate
             if audio_duration_sec < self._min_audio_duration_sec:
+                logger.debug(
+                    "⏭️ [PRÉ-PROCESSAMENTO] Áudio muito curto (antes de trim)",
+                    audio_duration_sec=round(audio_duration_sec, 3),
+                    min_duration_sec=self._min_audio_duration_sec,
+                    reason="Áudio menor que mínimo antes de trim"
+                )
                 return None
             
             # P1.2: Detecção de silêncio RMS - rejeitar chunks sem fala antes da transcrição
             # Evita alucinações do Whisper em áudio silencioso ou muito quieto
             has_speech = self._has_speech_rms(audio_array, sample_rate)
             if not has_speech:
+                logger.debug(
+                    "⏭️ [PRÉ-PROCESSAMENTO] RMS não detectou fala",
+                    audio_duration_sec=round(audio_duration_sec, 3),
+                    sample_rate=sample_rate,
+                    reason="has_speech_rms retornou False - possível silêncio apenas"
+                )
                 return None
             
             # P1.3: Trim de silêncio inicial/final - remove silêncio que causa alucinações
             audio_array, trim_info = self._trim_silence(audio_array, sample_rate)
             
-            # P4.2: Verificar se após trim ainda há áudio suficiente para transcrição confiável
-            # Mínimo aumentado para 1.5s (era 0.5s) para evitar transcrições de fragmentos mínimos
+            # REVISADO P4.2: Verificar se após trim ainda há áudio suficiente para transcrição confiável
+            # Reduzido de 1.5s para 0.8s para permitir transcrições de áudio mais curto
+            # 1.5s era muito restritivo e rejeitava áudio válido (ex: respostas curtas)
             audio_duration_sec_after_trim = len(audio_array) / sample_rate
-            min_audio_after_trim_sec = 1.5  # P4.2: Mínimo de 1.5s após trim (era 0.5s)
+            min_audio_after_trim_sec = 0.8  # REVISADO: Reduzido de 1.5s para 0.8s (era 0.5s antes de P4.2)
             if audio_duration_sec_after_trim < min_audio_after_trim_sec:
+                logger.debug(
+                    "⏭️ [PRÉ-PROCESSAMENTO] Áudio muito curto após trim",
+                    audio_duration_sec_before_trim=round(audio_duration_sec, 3),
+                    audio_duration_sec_after_trim=round(audio_duration_sec_after_trim, 3),
+                    min_audio_after_trim_sec=min_audio_after_trim_sec,
+                    trim_start_sec=trim_info.get('trimmed_start_sec', 0),
+                    trim_end_sec=trim_info.get('trimmed_end_sec', 0),
+                    reason=f"Áudio após trim ({audio_duration_sec_after_trim:.2f}s) menor que mínimo ({min_audio_after_trim_sec}s)"
+                )
                 return None
             
             # P2.2: Estimar SNR para VAD seletivo e ajuste de parâmetros
@@ -999,4 +1073,50 @@ class TranscriptionService:
             # Log de erro silencioso (será logado na função chamadora se necessário)
             # Retornar None indica falha no pré-processamento
             return None
+    
+    def _fix_common_transcription_errors(self, text: str) -> str:
+        """
+        FASE 3: Corrige erros comuns de transcrição do Whisper em português.
+        
+        Corrige erros de transcrição frequentes onde o Whisper separa incorretamente
+        palavras compostas (ex: "a diário" → "adiar").
+        
+        Esta função apenas corrige erros, não rejeita texto, garantindo que
+        feedbacks válidos não sejam bloqueados.
+        
+        Args:
+            text: Texto transcrito a ser corrigido
+        
+        Returns:
+            Texto corrigido
+        """
+        if not text:
+            return text
+        
+        original_text = text
+        
+        # Correções de palavras comuns (erros frequentes do Whisper em português)
+        corrections = [
+            # Erro: "preciso a diário" → correto: "preciso adiar"
+            (r'\bpreciso\s+a\s+diário\b', 'preciso adiar', re.IGNORECASE),
+            # Erro: "a diário" → correto: "adiar"
+            (r'\ba\s+diário\b', 'adiar', re.IGNORECASE),
+            # Erro: "a mar" → correto: "amar"
+            (r'\ba\s+mar\b', 'amar', re.IGNORECASE),
+            # Adicionar mais correções conforme necessário
+        ]
+        
+        corrected_text = text
+        for pattern, replacement, flags in corrections:
+            corrected_text = re.sub(pattern, replacement, corrected_text, flags=flags)
+        
+        if corrected_text != original_text:
+            logger.info(
+                "🔧 [FASE 3] Texto corrigido (erros comuns de transcrição)",
+                original=original_text[:100],
+                corrected=corrected_text[:100],
+                note="Correção automática de erros comuns sem bloquear feedbacks"
+            )
+        
+        return corrected_text
 
