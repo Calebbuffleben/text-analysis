@@ -286,21 +286,86 @@ class TranscriptionService:
                 audio_length_sec=round(len(audio_array) / sample_rate, 2)
             )
             
-            # Configurar parâmetros de transcrição para faster-whisper
-            # faster-whisper tem parâmetros ligeiramente diferentes
+            # P1.2: Detecção de silêncio RMS - rejeitar chunks sem fala antes da transcrição
+            # Evita alucinações do Whisper em áudio silencioso ou muito quieto
+            has_speech = self._has_speech_rms(audio_array, sample_rate)
+            if not has_speech:
+                logger.debug(
+                    "⏭️ [TRANSCRIÇÃO] Chunk não contém fala detectável (RMS muito baixo), ignorando",
+                    audio_samples=len(audio_array),
+                    audio_length_sec=round(len(audio_array) / sample_rate, 2)
+                )
+                return {
+                    'text': '',
+                    'language': language or self.language,
+                    'segments': [],
+                    'confidence': 0.0
+                }
+            
+            # P1.3: Trim de silêncio inicial/final - remove silêncio que causa alucinações
+            audio_array, trim_info = self._trim_silence(audio_array, sample_rate)
+            
+            # P4.2: Verificar se após trim ainda há áudio suficiente para transcrição confiável
+            # Mínimo aumentado para 1.5s (era 0.5s) para evitar transcrições de fragmentos mínimos
+            audio_duration_sec_after_trim = len(audio_array) / sample_rate
+            min_audio_after_trim_sec = 1.5  # P4.2: Mínimo de 1.5s após trim (era 0.5s)
+            if audio_duration_sec_after_trim < min_audio_after_trim_sec:
+                logger.debug(
+                    "⏭️ [TRANSCRIÇÃO] Áudio muito curto após trim de silêncio, ignorando",
+                    audio_duration_sec=round(audio_duration_sec_after_trim, 2),
+                    min_required_sec=min_audio_after_trim_sec,
+                    trim_info=trim_info
+                )
+                return {
+                    'text': '',
+                    'language': language or self.language,
+                    'segments': [],
+                    'confidence': 0.0
+                }
+            
+            logger.debug(
+                "✅ [TRANSCRIÇÃO] Pré-processamento concluído",
+                audio_samples=len(audio_array),
+                audio_length_sec=round(audio_duration_sec_after_trim, 2),
+                trim_info=trim_info
+            )
+            
+            # P2.2: Estimar SNR para VAD seletivo e ajuste de parâmetros
+            estimated_snr_db = self._estimate_snr(audio_array, sample_rate)
+            
+            # P2.3: Ajustar beam_size conforme duração do áudio
+            # Áudio mais longo se beneficia de beam search maior
+            beam_size = 7 if audio_duration_sec_after_trim >= 10.0 else 5
+            
+            # P2.2: VAD seletivo - ativar apenas se SNR for suficientemente alto
+            # SNR alto = áudio limpo = VAD seguro. SNR baixo = risco de remover fala válida
+            use_vad = estimated_snr_db > 10.0  # Threshold de 10dB para considerar áudio "limpo"
+            
+            # P2.1: Ajustar thresholds baseado em qualidade de áudio para reduzir alucinações
+            # no_speech_threshold: 0.5 (mais restritivo que 0.3, menos alucinações)
+            # log_prob_threshold: -1.0 (menos restritivo que -0.8, não corta fala válida)
+            # compression_ratio_threshold: 2.4 (menos agressivo que 2.0, permite repetições naturais)
             transcribe_options = {
                 'language': language or self.language,
                 'task': self.task,  # 'transcribe' ou 'translate'
                 'temperature': 0.0,  # Temperatura 0 = mais determinístico e preciso
                 'condition_on_previous_text': False,  # Evitar repetições quando texto anterior é ruim
-                'compression_ratio_threshold': 2.0,  # Detectar e filtrar repetições (reduzido de 2.4 para 2.0 para filtrar mais repetições)
-                'log_prob_threshold': -0.8,  # Filtrar segmentos com baixa confiança (aumentado de -1.0 para -0.8 para filtrar mais segmentos ruins)
-                'no_speech_threshold': 0.3,  # Threshold mais baixo (mais permissivo) - padrão era 0.6
-                'beam_size': 7,  # Beam search size (aumentado de 5 para 7 para maior precisão)
-                # VAD desabilitado - estava removendo todo o áudio válido
-                # O VAD do faster-whisper pode ser muito agressivo com áudio de chamadas
-                'vad_filter': False,  # Desabilitar VAD para evitar remoção de áudio válido
+                'compression_ratio_threshold': 2.4,  # P2.1: Menos agressivo (era 2.0) - permite repetições naturais
+                'log_prob_threshold': -1.0,  # P2.1: Menos restritivo (era -0.8) - não corta fala válida
+                'no_speech_threshold': 0.5,  # P2.1: Mais restritivo (era 0.3) - reduz alucinações em silêncio
+                'beam_size': beam_size,  # P2.3: Dinâmico conforme duração (5 para <10s, 7 para ≥10s)
+                'vad_filter': use_vad,  # P2.2: Seletivo baseado em SNR estimado
             }
+            
+            logger.debug(
+                "⚙️ [TRANSCRIÇÃO] Parâmetros configurados",
+                beam_size=beam_size,
+                vad_filter=use_vad,
+                estimated_snr_db=round(estimated_snr_db, 2),
+                no_speech_threshold=transcribe_options['no_speech_threshold'],
+                log_prob_threshold=transcribe_options['log_prob_threshold'],
+                compression_ratio_threshold=transcribe_options['compression_ratio_threshold']
+            )
             
             audio_length_sec = len(audio_array) / sample_rate
             logger.info(
@@ -374,12 +439,38 @@ class TranscriptionService:
                             # Converter segments para lista e processar
                             segments_list = list(segments)
                             
-                            # Construir texto completo concatenando segmentos
-                            text = " ".join(seg.text for seg in segments_list)
-                            
-                            # Converter segments para formato dict compatível
-                            segments_dict = []
+                            # P3.1: Filtrar segmentos por no_speech_prob e avg_logprob antes de concatenar
+                            # Ignorar segmentos com alta probabilidade de não ter fala ou baixa confiança
+                            # Isso remove alucinações já detectadas pelo Whisper
+                            filtered_segments = []
+                            filtered_count = 0
                             for seg in segments_list:
+                                no_speech_prob = getattr(seg, 'no_speech_prob', 0.0)
+                                avg_logprob = getattr(seg, 'avg_logprob', 0.0)
+                                
+                                # Manter apenas segmentos com:
+                                # - no_speech_prob <= 0.6 (probabilidade de não ter fala baixa)
+                                # - avg_logprob > -1.0 (confiança razoável)
+                                if no_speech_prob <= 0.6 and avg_logprob > -1.0:
+                                    filtered_segments.append(seg)
+                                else:
+                                    filtered_count += 1
+                            
+                            # Construir texto completo concatenando apenas segmentos filtrados
+                            text = " ".join(seg.text for seg in filtered_segments).strip()
+                            
+                            # Log de filtragem para diagnóstico
+                            if filtered_count > 0:
+                                logger.debug(
+                                    "🔍 [P3.1] Segmentos filtrados",
+                                    total_segments=len(segments_list),
+                                    filtered_out=filtered_count,
+                                    kept_segments=len(filtered_segments)
+                                )
+                            
+                            # Converter segments filtrados para formato dict compatível
+                            segments_dict = []
+                            for seg in filtered_segments:
                                 segments_dict.append({
                                     'start': seg.start,
                                     'end': seg.end,
@@ -453,7 +544,7 @@ class TranscriptionService:
             detected_language = result.get('language', language or self.language)
             segments = result.get('segments', [])
             
-            # Calcular confiança média dos segmentos
+            # Calcular confiança média dos segmentos (após filtro P3.1)
             confidence = 0.0
             if segments:
                 confidences = [
@@ -471,6 +562,29 @@ class TranscriptionService:
             unique_words = set(text_words)
             repetition_ratio = 1.0 - (len(unique_words) / len(text_words)) if text_words else 0.0
             has_repetition = repetition_ratio > 0.3  # Mais de 30% de repetição
+            
+            # P3.2: Validar texto agregado antes de retornar
+            # Se confidence muito baixa ou repetição muito alta, retornar texto vazio
+            # Isso evita propagar alucinações quando a qualidade não permite transcrição confiável
+            min_confidence = 0.3  # Confidence mínima aceitável
+            max_repetition_ratio = 0.5  # Repetition ratio máximo aceitável (50%)
+            
+            if confidence < min_confidence or repetition_ratio > max_repetition_ratio:
+                logger.warn(
+                    "⚠️ [TRANSCRIÇÃO] Texto rejeitado por baixa qualidade",
+                    confidence=round(confidence, 3),
+                    min_confidence=min_confidence,
+                    repetition_ratio=round(repetition_ratio, 3),
+                    max_repetition_ratio=max_repetition_ratio,
+                    text_preview=text[:50] if text else '',
+                    reason='low_confidence' if confidence < min_confidence else 'high_repetition'
+                )
+                return {
+                    'text': '',  # Retornar texto vazio em vez de alucinações
+                    'language': detected_language,
+                    'segments': [],  # Também retornar segments vazio
+                    'confidence': 0.0
+                }
             
             # Log detalhado dos segmentos para diagnóstico
             segment_previews = []
@@ -559,47 +673,207 @@ class TranscriptionService:
                 else:
                     logger.warn(f"Unsupported sample width: {sample_width}")
                     return None
-                
-                # Converter para float32 e normalizar (-1.0 a 1.0)
-                # Para int16: dividir por 32768.0
-                # Para int32: dividir por 2147483648.0
-                if sample_width == 2:
-                    audio_float = audio_array.astype(np.float32) / 32768.0
-                else:
-                    audio_float = audio_array.astype(np.float32) / 2147483648.0
-                
-                # Converter estéreo para mono (média dos canais)
-                if num_channels == 2:
-                    audio_float = audio_float.reshape(-1, 2).mean(axis=1)
-                
-                # Resample se necessário (Whisper funciona melhor com 16kHz)
-                # Nota: Se o áudio já estiver em 16kHz, não precisa resample
-                if sample_rate != expected_sample_rate:
-                    try:
-                        from scipy import signal
-                        num_samples = int(len(audio_float) * expected_sample_rate / sample_rate)
-                        if num_samples > 0:
-                            audio_float = signal.resample(audio_float, num_samples)
-                            logger.debug(
-                                "Audio resampled",
-                                from_rate=sample_rate,
-                                to_rate=expected_sample_rate,
-                                original_samples=len(audio_array),
-                                resampled_samples=num_samples
-                            )
-                        else:
-                            logger.warn("Invalid resample target, keeping original sample rate")
-                    except ImportError:
-                        logger.warn("scipy not available, skipping resample - Whisper will handle it")
-                        # Whisper pode lidar com diferentes sample rates, mas 16kHz é ideal
-                    except Exception as e:
-                        logger.warn(f"Resample failed: {e}, keeping original sample rate")
-                else:
-                    logger.debug("Audio already at target sample rate, no resample needed")
-                
-                return audio_float
-                
-        except Exception as e:
-            logger.error("Failed to decode WAV", error=str(e))
-            return None
+    
+    def _has_speech_rms(self, audio_array: np.ndarray, sample_rate: int, 
+                       rms_threshold_db: float = -40.0, window_size_ms: int = 100) -> bool:
+        """
+        P1.2: Detecta se o áudio contém fala baseado em RMS (Root Mean Square).
+        
+        Calcula RMS em janelas curtas e verifica se algum trecho tem energia suficiente
+        para indicar fala. Mais leve que VAD completo e eficaz para filtrar silêncio.
+        
+        Args:
+            audio_array: Array numpy de áudio normalizado (-1 a 1)
+            sample_rate: Taxa de amostragem em Hz
+            rms_threshold_db: Threshold em dB (padrão -40dB, mais alto = mais restritivo)
+            window_size_ms: Tamanho da janela em ms para calcular RMS
+        
+        Returns:
+            True se detectar fala, False se apenas silêncio/ruído
+        """
+        if len(audio_array) == 0:
+            return False
+        
+        # Converter threshold dB para linear (RMS)
+        # dB = 20 * log10(RMS)
+        # RMS = 10^(dB/20)
+        rms_threshold_linear = 10 ** (rms_threshold_db / 20.0)
+        
+        # Calcular tamanho da janela em samples
+        window_samples = int(sample_rate * window_size_ms / 1000.0)
+        if window_samples < 1:
+            window_samples = 1
+        
+        # Calcular RMS em janelas sobrepostas
+        max_rms = 0.0
+        for i in range(0, len(audio_array), window_samples // 2):  # Overlap de 50%
+            window = audio_array[i:i + window_samples]
+            if len(window) == 0:
+                break
+            
+            # RMS = sqrt(mean(samples^2))
+            rms = np.sqrt(np.mean(window ** 2))
+            max_rms = max(max_rms, rms)
+        
+        has_speech = max_rms >= rms_threshold_linear
+        
+        logger.debug(
+            "🔍 [PRÉ-PROCESSAMENTO] Verificação RMS de fala",
+            max_rms_db=round(20 * np.log10(max_rms + 1e-10), 2),
+            threshold_db=rms_threshold_db,
+            has_speech=has_speech,
+            window_samples=window_samples
+        )
+        
+        return has_speech
+    
+    def _trim_silence(self, audio_array: np.ndarray, sample_rate: int,
+                     silence_threshold_db: float = -35.0, frame_length_ms: int = 50,
+                     hop_length_ms: int = 25):
+        """
+        P1.3: Remove silêncio inicial e final do áudio.
+        
+        Remove períodos de silêncio que causam alucinações do Whisper.
+        Mantém padding mínimo para preservar contexto de fala.
+        
+        Args:
+            audio_array: Array numpy de áudio normalizado (-1 a 1)
+            sample_rate: Taxa de amostragem em Hz
+            silence_threshold_db: Threshold em dB para considerar silêncio (padrão -35dB)
+            frame_length_ms: Tamanho do frame em ms
+            hop_length_ms: Tamanho do hop em ms
+        
+        Returns:
+            Tuple (audio_trimmed, info_dict) onde info_dict contém estatísticas do trim
+        """
+        if len(audio_array) == 0:
+            return audio_array, {'trimmed_start_sec': 0.0, 'trimmed_end_sec': 0.0, 'original_length_sec': 0.0}
+        
+        original_length = len(audio_array)
+        original_duration_sec = original_length / sample_rate
+        
+        # Converter threshold dB para linear
+        silence_threshold_linear = 10 ** (silence_threshold_db / 20.0)
+        
+        # Calcular tamanhos em samples
+        frame_samples = int(sample_rate * frame_length_ms / 1000.0)
+        hop_samples = int(sample_rate * hop_length_ms / 1000.0)
+        
+        if frame_samples < 1:
+            frame_samples = 1
+        if hop_samples < 1:
+            hop_samples = 1
+        
+        # Encontrar início da fala (primeira janela com RMS acima do threshold)
+        start_idx = 0
+        for i in range(0, len(audio_array) - frame_samples, hop_samples):
+            window = audio_array[i:i + frame_samples]
+            rms = np.sqrt(np.mean(window ** 2))
+            if rms >= silence_threshold_linear:
+                # Encontrar início: voltar até encontrar silêncio ou início
+                # Procurar retroativamente por padding mínimo (100ms)
+                padding_samples = int(sample_rate * 0.1)  # 100ms padding
+                start_idx = max(0, i - padding_samples)
+                break
+        
+        # Encontrar fim da fala (última janela com RMS acima do threshold)
+        end_idx = len(audio_array)
+        for i in range(len(audio_array) - frame_samples, 0, -hop_samples):
+            window = audio_array[i:i + frame_samples]
+            rms = np.sqrt(np.mean(window ** 2))
+            if rms >= silence_threshold_linear:
+                # Encontrar fim: avançar até encontrar silêncio ou fim
+                # Procurar prospectivamente por padding mínimo (100ms)
+                padding_samples = int(sample_rate * 0.1)  # 100ms padding
+                end_idx = min(len(audio_array), i + frame_samples + padding_samples)
+                break
+        
+        # Se não encontrou fala, manter mínimo (não remover tudo)
+        if end_idx <= start_idx:
+            # Manter pelo menos 100ms do centro
+            center = len(audio_array) // 2
+            min_samples = int(sample_rate * 0.1)
+            start_idx = max(0, center - min_samples // 2)
+            end_idx = min(len(audio_array), center + min_samples // 2)
+        
+        # Aplicar trim
+        audio_trimmed = audio_array[start_idx:end_idx]
+        
+        trimmed_start_sec = start_idx / sample_rate
+        trimmed_end_sec = (len(audio_array) - end_idx) / sample_rate
+        trimmed_length_sec = len(audio_trimmed) / sample_rate
+        
+        trim_info = {
+            'trimmed_start_sec': round(trimmed_start_sec, 3),
+            'trimmed_end_sec': round(trimmed_end_sec, 3),
+            'original_length_sec': round(original_duration_sec, 3),
+            'trimmed_length_sec': round(trimmed_length_sec, 3),
+            'samples_removed_start': start_idx,
+            'samples_removed_end': len(audio_array) - end_idx
+        }
+        
+        logger.debug(
+            "✂️ [PRÉ-PROCESSAMENTO] Trim de silêncio aplicado",
+            **trim_info
+        )
+        
+        return audio_trimmed, trim_info
+    
+    def _estimate_snr(self, audio_array: np.ndarray, sample_rate: int,
+                     frame_length_ms: int = 100) -> float:
+        """
+        P2.2: Estima SNR (Signal-to-Noise Ratio) do áudio usando análise de energia.
+        
+        Calcula diferença entre energia em regiões de fala vs silêncio.
+        Usado para decidir se VAD pode ser usado com segurança.
+        
+        Args:
+            audio_array: Array numpy de áudio normalizado (-1 a 1)
+            sample_rate: Taxa de amostragem em Hz
+            frame_length_ms: Tamanho do frame em ms para análise
+        
+        Returns:
+            SNR estimado em dB (pode ser negativo se muito ruidoso)
+        """
+        if len(audio_array) == 0:
+            return -999.0  # SNR muito baixo (inválido)
+        
+        frame_samples = int(sample_rate * frame_length_ms / 1000.0)
+        if frame_samples < 1:
+            frame_samples = 1
+        
+        # Calcular energia RMS por frame
+        frame_energies = []
+        for i in range(0, len(audio_array), frame_samples):
+            frame = audio_array[i:i + frame_samples]
+            if len(frame) == 0:
+                break
+            rms = np.sqrt(np.mean(frame ** 2))
+            frame_energies.append(rms)
+        
+        if len(frame_energies) < 2:
+            return -999.0
+        
+        frame_energies = np.array(frame_energies)
+        
+        # Estimar energia de sinal (frames com maior energia - percentil 75)
+        # Estimar energia de ruído (frames com menor energia - percentil 25)
+        signal_energy = np.percentile(frame_energies, 75)
+        noise_energy = np.percentile(frame_energies, 25)
+        
+        # Evitar divisão por zero
+        if noise_energy < 1e-10:
+            # Se ruído muito baixo, assumir SNR alto
+            if signal_energy > 1e-10:
+                return 30.0  # SNR alto (limite superior)
+            else:
+                return -999.0  # Áudio muito quieto
+        
+        # SNR = 20 * log10(signal_rms / noise_rms)
+        snr_db = 20 * np.log10(signal_energy / noise_energy)
+        
+        # Limitar valores extremos
+        snr_db = max(-40.0, min(40.0, snr_db))
+        
+        return float(snr_db)
 

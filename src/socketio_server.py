@@ -46,9 +46,10 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 audio_buffer_service = AudioBufferService(
-    # Default 5s: bom equilíbrio para tempo real, mas pode cortar frases no meio.
+    # P4.1: Buffer mínimo aumentado para 7s - contexto maior reduz alucinações do Whisper
+    # Trade-off: Latência ligeiramente maior, mas melhora significativa na precisão
     # Para testes manuais, experimente 8-10s para reduzir truncamento de frases.
-    min_duration_sec=_env_float('AUDIO_BUFFER_MIN_DURATION_SEC', 5.0),
+    min_duration_sec=_env_float('AUDIO_BUFFER_MIN_DURATION_SEC', 7.0),  # P4.1: Aumentado de 5.0s para 7.0s
     max_duration_sec=_env_float('AUDIO_BUFFER_MAX_DURATION_SEC', 10.0),
     flush_interval_sec=_env_float('AUDIO_BUFFER_FLUSH_INTERVAL_SEC', 2.0),
 )
