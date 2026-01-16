@@ -18,7 +18,7 @@ services:
       - HOST=0.0.0.0
       - MODEL_CACHE_DIR=/app/models/.cache
       - MODEL_DEVICE=cpu
-      - WHISPER_MODEL_NAME=medium
+      - WHISPER_MODEL_NAME=tiny
       - WHISPER_DEVICE=cpu
       - WHISPER_LANGUAGE=pt
       - SENTIMENT_MODEL=neuralmind/bert-base-portuguese-cased
