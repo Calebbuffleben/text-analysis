@@ -181,6 +181,9 @@ async def connect(sid, environ):
     Args:
         sid: Session ID do cliente
         environ: Informações do ambiente WSGI
+    
+    Returns:
+        True para aceitar a conexão, False para rejeitar
     """
     # DIAGNÓSTICO: Log imediato
     print(f"[DIAGNÓSTICO] connect chamado! sid={sid}")
@@ -197,6 +200,10 @@ async def connect(sid, environ):
     )
     
     print(f"[DIAGNÓSTICO] Após logger.info de conexão")
+    
+    # CRÍTICO: Retornar True para aceitar a conexão
+    # Se não retornar True explicitamente, o python-socketio pode fechar a conexão
+    return True
 
 
 @sio.event
