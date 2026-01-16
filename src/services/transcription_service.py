@@ -242,13 +242,8 @@ class TranscriptionService:
             self._transcription_semaphore = asyncio.Semaphore(1)
         
         try:
-            logger.debug(
-                "🔍 [TRANSCRIÇÃO] Decodificando WAV",
-                audio_size_bytes=len(audio_data),
-                expected_sample_rate=sample_rate
-            )
-            
-            # Validar sample_rate antes de usar
+            # FASE 2: Validações rápidas (<1ms, no event loop)
+            # Validações que não bloqueiam o event loop
             if sample_rate <= 0:
                 logger.warn(
                     "⚠️ [TRANSCRIÇÃO] Sample rate inválido",
@@ -261,52 +256,40 @@ class TranscriptionService:
                     'confidence': 0.0
                 }
             
-            # Decodificar WAV para array numpy
-            # O Whisper espera áudio como array numpy float32 normalizado (-1 a 1)
-            audio_array = self._decode_wav(audio_data, sample_rate)
+            # FASE 2: Pré-processamento no executor (não bloqueia event loop)
+            # Todas as operações bloqueantes (decode_wav, RMS, trim, SNR) são executadas
+            # em thread separada, permitindo que o event loop processe outros eventos
+            # (ex: health_ping, outros handlers Socket.IO)
             
-            if audio_array is None or len(audio_array) == 0:
-                logger.warn(
-                    "⚠️ [TRANSCRIÇÃO] Áudio vazio ou inválido",
-                    audio_size_bytes=len(audio_data)
-                )
-                return {
-                    'text': '',
-                    'language': language or self.language,
-                    'segments': [],
-                    'confidence': 0.0
-                }
-            
-            # Filtrar chunks muito pequenos
-            audio_duration_sec = len(audio_array) / sample_rate
-            if audio_duration_sec < self._min_audio_duration_sec:
-                logger.debug(
-                    "⏭️ [TRANSCRIÇÃO] Chunk muito pequeno, ignorando",
-                    audio_duration_sec=round(audio_duration_sec, 2),
-                    min_duration_sec=self._min_audio_duration_sec,
-                    audio_samples=len(audio_array)
-                )
-                return {
-                    'text': '',
-                    'language': language or self.language,
-                    'segments': [],
-                    'confidence': 0.0
-                }
+            # Obter event loop para executar no executor
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = asyncio.get_event_loop()
             
             logger.debug(
-                "✅ [TRANSCRIÇÃO] WAV decodificado",
-                audio_samples=len(audio_array),
-                audio_length_sec=round(len(audio_array) / sample_rate, 2)
+                "🔄 [TRANSCRIÇÃO] Iniciando pré-processamento em thread separada (não bloqueia event loop)",
+                audio_size_bytes=len(audio_data),
+                expected_sample_rate=sample_rate
             )
             
-            # P1.2: Detecção de silêncio RMS - rejeitar chunks sem fala antes da transcrição
-            # Evita alucinações do Whisper em áudio silencioso ou muito quieto
-            has_speech = self._has_speech_rms(audio_array, sample_rate)
-            if not has_speech:
+            # Executar pré-processamento no executor (FASE 2)
+            # Operações bloqueantes: _decode_wav(), _has_speech_rms(), _trim_silence(), _estimate_snr()
+            # Isso libera o event loop para processar outros eventos (ex: health_ping)
+            preprocess_result = await loop.run_in_executor(
+                self._executor,
+                self._preprocess_audio_sync,
+                audio_data,
+                sample_rate,
+                language
+            )
+            
+            # Verificar se pré-processamento foi bem-sucedido
+            if preprocess_result is None:
                 logger.debug(
-                    "⏭️ [TRANSCRIÇÃO] Chunk não contém fala detectável (RMS muito baixo), ignorando",
-                    audio_samples=len(audio_array),
-                    audio_length_sec=round(len(audio_array) / sample_rate, 2)
+                    "⏭️ [TRANSCRIÇÃO] Pré-processamento rejeitou áudio (validação falhou)",
+                    audio_size_bytes=len(audio_data),
+                    sample_rate=sample_rate
                 )
                 return {
                     'text': '',
@@ -315,105 +298,54 @@ class TranscriptionService:
                     'confidence': 0.0
                 }
             
-            # P1.3: Trim de silêncio inicial/final - remove silêncio que causa alucinações
-            audio_array, trim_info = self._trim_silence(audio_array, sample_rate)
-            
-            # P4.2: Verificar se após trim ainda há áudio suficiente para transcrição confiável
-            # Mínimo aumentado para 1.5s (era 0.5s) para evitar transcrições de fragmentos mínimos
-            audio_duration_sec_after_trim = len(audio_array) / sample_rate
-            min_audio_after_trim_sec = 1.5  # P4.2: Mínimo de 1.5s após trim (era 0.5s)
-            if audio_duration_sec_after_trim < min_audio_after_trim_sec:
-                logger.debug(
-                    "⏭️ [TRANSCRIÇÃO] Áudio muito curto após trim de silêncio, ignorando",
-                    audio_duration_sec=round(audio_duration_sec_after_trim, 2),
-                    min_required_sec=min_audio_after_trim_sec,
-                    trim_info=trim_info
-                )
-                return {
-                    'text': '',
-                    'language': language or self.language,
-                    'segments': [],
-                    'confidence': 0.0
-                }
+            # Extrair dados do pré-processamento
+            audio_array = preprocess_result['audio_array']
+            trim_info = preprocess_result['trim_info']
+            estimated_snr_db = preprocess_result['estimated_snr_db']
+            beam_size = preprocess_result['beam_size']
+            use_vad = preprocess_result['use_vad']
+            audio_duration_sec_after_trim = preprocess_result['audio_duration_sec_after_trim']
+            transcribe_options = preprocess_result['transcribe_options']
             
             logger.debug(
                 "✅ [TRANSCRIÇÃO] Pré-processamento concluído",
                 audio_samples=len(audio_array),
                 audio_length_sec=round(audio_duration_sec_after_trim, 2),
-                trim_info=trim_info
-            )
-            
-            # P2.2: Estimar SNR para VAD seletivo e ajuste de parâmetros
-            estimated_snr_db = self._estimate_snr(audio_array, sample_rate)
-            
-            # P2.3: Ajustar beam_size conforme duração do áudio
-            # Áudio mais longo se beneficia de beam search maior
-            beam_size = 7 if audio_duration_sec_after_trim >= 10.0 else 5
-            
-            # P2.2: VAD seletivo - ativar apenas se SNR for suficientemente alto
-            # SNR alto = áudio limpo = VAD seguro. SNR baixo = risco de remover fala válida
-            use_vad = estimated_snr_db > 10.0  # Threshold de 10dB para considerar áudio "limpo"
-            
-            # P2.1: Ajustar thresholds baseado em qualidade de áudio para reduzir alucinações
-            # no_speech_threshold: 0.5 (mais restritivo que 0.3, menos alucinações)
-            # log_prob_threshold: -1.0 (menos restritivo que -0.8, não corta fala válida)
-            # compression_ratio_threshold: 2.4 (menos agressivo que 2.0, permite repetições naturais)
-            transcribe_options = {
-                'language': language or self.language,
-                'task': self.task,  # 'transcribe' ou 'translate'
-                'temperature': 0.0,  # Temperatura 0 = mais determinístico e preciso
-                'condition_on_previous_text': False,  # Evitar repetições quando texto anterior é ruim
-                'compression_ratio_threshold': 2.4,  # P2.1: Menos agressivo (era 2.0) - permite repetições naturais
-                'log_prob_threshold': -1.0,  # P2.1: Menos restritivo (era -0.8) - não corta fala válida
-                'no_speech_threshold': 0.5,  # P2.1: Mais restritivo (era 0.3) - reduz alucinações em silêncio
-                'beam_size': beam_size,  # P2.3: Dinâmico conforme duração (5 para <10s, 7 para ≥10s)
-                'vad_filter': use_vad,  # P2.2: Seletivo baseado em SNR estimado
-            }
-            
-            logger.debug(
-                "⚙️ [TRANSCRIÇÃO] Parâmetros configurados",
-                beam_size=beam_size,
-                vad_filter=use_vad,
+                trim_info=trim_info,
                 estimated_snr_db=round(estimated_snr_db, 2),
-                no_speech_threshold=transcribe_options['no_speech_threshold'],
-                log_prob_threshold=transcribe_options['log_prob_threshold'],
-                compression_ratio_threshold=transcribe_options['compression_ratio_threshold']
+                beam_size=beam_size,
+                vad_filter=use_vad
             )
             
-            audio_length_sec = len(audio_array) / sample_rate
             logger.info(
                 "🎙️ [TRANSCRIÇÃO] Iniciando transcrição com Whisper",
-                audio_length_sec=round(audio_length_sec, 2),
+                audio_length_sec=round(audio_duration_sec_after_trim, 2),
                 audio_samples=len(audio_array),
-                sample_rate=sample_rate,
+                sample_rate=preprocess_result['sample_rate'],
                 language=transcribe_options['language'],
                 model=self.model_name,
                 device=self.device
             )
             
-            # Transcrever áudio em thread separada para não bloquear event loop
-            # Whisper é CPU/GPU intensivo e pode demorar alguns segundos
-            # Usar get_running_loop() para Python 3.7+ (mais seguro)
-            try:
-                loop = asyncio.get_running_loop()
-            except RuntimeError:
-                # Fallback para get_event_loop() se não houver loop rodando
-                loop = asyncio.get_event_loop()
+            # FASE 3: Transcrição (semáforo + executor)
+            # O semáforo é usado APENAS para limitar transcrições simultâneas do Whisper
+            # Pré-processamento já foi executado no executor, fora do semáforo
+            # Isso garante que o event loop permanece livre durante pré-processamento
             
-            # Usar semáforo para limitar transcrições simultâneas
-            # Isso evita sobrecarga do Whisper quando muitos chunks chegam ao mesmo tempo
-            logger.debug(
-                "🔄 [TRANSCRIÇÃO] Aguardando slot disponível para transcrição",
-                audio_length_sec=round(len(audio_array) / sample_rate, 2),
-                active_transcriptions=self._active_transcriptions
-            )
-            
-            # Inicializar variáveis de latência no início para garantir que estão definidas
+            # Inicializar variáveis de latência antes de adquirir semáforo
             transcribe_start = time.perf_counter()
             transcribe_latency_ms = 0.0
             
-            # Adquirir semáforo ANTES de qualquer processamento
-            # Isso garante que apenas uma transcrição por vez seja processada
+            logger.debug(
+                "🔄 [TRANSCRIÇÃO] Aguardando slot disponível para transcrição",
+                audio_length_sec=round(audio_duration_sec_after_trim, 2),
+                active_transcriptions=self._active_transcriptions
+            )
+            
+            # FASE 3: Adquirir semáforo APENAS para transcrição do Whisper
+            # Pré-processamento não precisa do semáforo (já executado no executor)
+            # Semáforo garante que apenas uma transcrição Whisper execute por vez
+            
             async with self._transcription_semaphore:
                 self._active_transcriptions += 1
                 result = None
@@ -434,7 +366,7 @@ class TranscriptionService:
                         "⏳ [TRANSCRIÇÃO] Chamando faster-whisper model.transcribe",
                         active_transcriptions=self._active_transcriptions,
                         audio_samples=len(audio_array),
-                        audio_length_sec=round(len(audio_array) / sample_rate, 2),
+                        audio_length_sec=round(audio_duration_sec_after_trim, 2),
                         model=self.model_name,
                         compute_type=self.compute_type,
                         timeout_sec=30.0
@@ -446,6 +378,7 @@ class TranscriptionService:
                     audio_ref = audio_array.copy()
                     options_ref = transcribe_options.copy()
                     language_ref = language or self.language  # Capturar language no closure
+                    sample_rate_ref = preprocess_result['sample_rate']  # Capturar sample_rate no closure
                     
                     def transcribe_sync():
                         try:
@@ -503,7 +436,7 @@ class TranscriptionService:
                                 'language': info.language if hasattr(info, 'language') else language_ref,
                                 'language_probability': getattr(info, 'language_probability', 1.0),
                                 'segments': segments_dict,
-                                'duration': getattr(info, 'duration', len(audio_ref) / sample_rate)
+                                'duration': getattr(info, 'duration', len(audio_ref) / sample_rate_ref)
                             }
                         except Exception as e:
                             logger.error(f"Erro dentro do transcribe_sync: {e}")
@@ -526,7 +459,7 @@ class TranscriptionService:
                     logger.error(
                         "⏱️ [TRANSCRIÇÃO] Timeout na transcrição (30s excedido)",
                         latency_ms=round(transcribe_latency_ms, 2),
-                        audio_length_sec=round(len(audio_array) / sample_rate, 2),
+                        audio_length_sec=round(audio_duration_sec_after_trim, 2),
                         model=self.model_name
                     )
                     result = None
@@ -958,4 +891,112 @@ class TranscriptionService:
         snr_db = max(-40.0, min(40.0, snr_db))
         
         return float(snr_db)
+    
+    def _preprocess_audio_sync(
+        self,
+        audio_data: bytes,
+        sample_rate: int,
+        language: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Fase 1: Pré-processamento de áudio executado em thread separada (síncrono).
+        
+        Encapsula todas as operações bloqueantes de pré-processamento:
+        - Decodificação WAV
+        - Validações de áudio
+        - Detecção de fala (RMS)
+        - Trim de silêncio
+        - Estimação de SNR
+        - Cálculo de parâmetros para transcrição
+        
+        Esta função é executada no ThreadPoolExecutor para não bloquear o event loop.
+        
+        Args:
+            audio_data: Bytes do arquivo WAV (incluindo header)
+            sample_rate: Taxa de amostragem do áudio (Hz)
+            language: Idioma do áudio (opcional)
+        
+        Returns:
+            Dict com dados de pré-processamento se sucesso, None se validação falhar:
+            {
+                'audio_array': np.ndarray,  # Áudio processado e validado
+                'sample_rate': int,
+                'trim_info': dict,
+                'estimated_snr_db': float,
+                'beam_size': int,
+                'use_vad': bool,
+                'audio_duration_sec_after_trim': float,
+                'transcribe_options': dict  # Opções para model.transcribe()
+            }
+        """
+        try:
+            # Decodificar WAV para array numpy
+            # O Whisper espera áudio como array numpy float32 normalizado (-1 a 1)
+            audio_array = self._decode_wav(audio_data, sample_rate)
+            
+            if audio_array is None or len(audio_array) == 0:
+                return None
+            
+            # Filtrar chunks muito pequenos
+            audio_duration_sec = len(audio_array) / sample_rate
+            if audio_duration_sec < self._min_audio_duration_sec:
+                return None
+            
+            # P1.2: Detecção de silêncio RMS - rejeitar chunks sem fala antes da transcrição
+            # Evita alucinações do Whisper em áudio silencioso ou muito quieto
+            has_speech = self._has_speech_rms(audio_array, sample_rate)
+            if not has_speech:
+                return None
+            
+            # P1.3: Trim de silêncio inicial/final - remove silêncio que causa alucinações
+            audio_array, trim_info = self._trim_silence(audio_array, sample_rate)
+            
+            # P4.2: Verificar se após trim ainda há áudio suficiente para transcrição confiável
+            # Mínimo aumentado para 1.5s (era 0.5s) para evitar transcrições de fragmentos mínimos
+            audio_duration_sec_after_trim = len(audio_array) / sample_rate
+            min_audio_after_trim_sec = 1.5  # P4.2: Mínimo de 1.5s após trim (era 0.5s)
+            if audio_duration_sec_after_trim < min_audio_after_trim_sec:
+                return None
+            
+            # P2.2: Estimar SNR para VAD seletivo e ajuste de parâmetros
+            estimated_snr_db = self._estimate_snr(audio_array, sample_rate)
+            
+            # P2.3: Ajustar beam_size conforme duração do áudio
+            # Áudio mais longo se beneficia de beam search maior
+            beam_size = 7 if audio_duration_sec_after_trim >= 10.0 else 5
+            
+            # P2.2: VAD seletivo - ativar apenas se SNR for suficientemente alto
+            # SNR alto = áudio limpo = VAD seguro. SNR baixo = risco de remover fala válida
+            use_vad = estimated_snr_db > 10.0  # Threshold de 10dB para considerar áudio "limpo"
+            
+            # P2.1: Ajustar thresholds baseado em qualidade de áudio para reduzir alucinações
+            # no_speech_threshold: 0.5 (mais restritivo que 0.3, menos alucinações)
+            # log_prob_threshold: -1.0 (menos restritivo que -0.8, não corta fala válida)
+            # compression_ratio_threshold: 2.4 (menos agressivo que 2.0, permite repetições naturais)
+            transcribe_options = {
+                'language': language or self.language,
+                'task': self.task,  # 'transcribe' ou 'translate'
+                'temperature': 0.0,  # Temperatura 0 = mais determinístico e preciso
+                'condition_on_previous_text': False,  # Evitar repetições quando texto anterior é ruim
+                'compression_ratio_threshold': 2.4,  # P2.1: Menos agressivo (era 2.0) - permite repetições naturais
+                'log_prob_threshold': -1.0,  # P2.1: Menos restritivo (era -0.8) - não corta fala válida
+                'no_speech_threshold': 0.5,  # P2.1: Mais restritivo (era 0.3) - reduz alucinações em silêncio
+                'beam_size': beam_size,  # P2.3: Dinâmico conforme duração (5 para <10s, 7 para ≥10s)
+                'vad_filter': use_vad,  # P2.2: Seletivo baseado em SNR estimado
+            }
+            
+            return {
+                'audio_array': audio_array,
+                'sample_rate': sample_rate,
+                'trim_info': trim_info,
+                'estimated_snr_db': estimated_snr_db,
+                'beam_size': beam_size,
+                'use_vad': use_vad,
+                'audio_duration_sec_after_trim': audio_duration_sec_after_trim,
+                'transcribe_options': transcribe_options
+            }
+        except Exception as e:
+            # Log de erro silencioso (será logado na função chamadora se necessário)
+            # Retornar None indica falha no pré-processamento
+            return None
 
