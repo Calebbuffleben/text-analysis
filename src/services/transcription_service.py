@@ -673,6 +673,49 @@ class TranscriptionService:
                 else:
                     logger.warn(f"Unsupported sample width: {sample_width}")
                     return None
+                
+                # Converter para float32 e normalizar (-1.0 a 1.0)
+                # Para int16: dividir por 32768.0
+                # Para int32: dividir por 2147483648.0
+                if sample_width == 2:
+                    audio_float = audio_array.astype(np.float32) / 32768.0
+                else:
+                    audio_float = audio_array.astype(np.float32) / 2147483648.0
+                
+                # Converter estéreo para mono (média dos canais)
+                if num_channels == 2:
+                    audio_float = audio_float.reshape(-1, 2).mean(axis=1)
+                
+                # Resample se necessário (Whisper funciona melhor com 16kHz)
+                # Nota: Se o áudio já estiver em 16kHz, não precisa resample
+                if sample_rate != expected_sample_rate:
+                    try:
+                        from scipy import signal
+                        num_samples = int(len(audio_float) * expected_sample_rate / sample_rate)
+                        if num_samples > 0:
+                            audio_float = signal.resample(audio_float, num_samples)
+                            logger.debug(
+                                "Audio resampled",
+                                from_rate=sample_rate,
+                                to_rate=expected_sample_rate,
+                                original_samples=len(audio_array),
+                                resampled_samples=num_samples
+                            )
+                        else:
+                            logger.warn("Invalid resample target, keeping original sample rate")
+                    except ImportError:
+                        logger.warn("scipy not available, skipping resample - Whisper will handle it")
+                        # Whisper pode lidar com diferentes sample rates, mas 16kHz é ideal
+                    except Exception as e:
+                        logger.warn(f"Resample failed: {e}, keeping original sample rate")
+                else:
+                    logger.debug("Audio already at target sample rate, no resample needed")
+                
+                return audio_float
+                
+        except Exception as e:
+            logger.error("Failed to decode WAV", error=str(e))
+            return None
     
     def _has_speech_rms(self, audio_array: np.ndarray, sample_rate: int, 
                        rms_threshold_db: float = -40.0, window_size_ms: int = 100) -> bool:
