@@ -307,6 +307,22 @@ Para habilitar a classificação de categorias de vendas, configure:
 SBERT_MODEL_NAME=sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
 ```
 
+### IMPORTANT: intensity vs confidence
+
+**intensity** is used for signal collection (semantic strength):
+- Represents absolute match strength of the best category (0.0-1.0)
+- Use intensity for initial filtering/threshold checking
+- Generally higher than confidence when categories are close
+- Example: intensity = 0.35 means 35% semantic match with best category
+
+**confidence** is used only for final validation (class separation):
+- Represents relative difference between best and second-best category (0.0-1.0)
+- Use confidence only for average confidence validation
+- Can be very low (e.g., 0.007) even when intensity is valid
+- Example: confidence = 0.007 means categories are very close (low separation)
+
+**Do NOT use confidence for initial filtering** - it can be very low even when the semantic match is valid. Always use intensity for collection thresholds.
+
 ### Uso
 
 A classificação é automática quando o serviço recebe transcrições. O resultado inclui:
@@ -315,7 +331,8 @@ A classificação é automática quando o serviço recebe transcrições. O resu
 {
   "analysis": {
     "sales_category": "price_interest",
-    "sales_category_confidence": 0.85,
+    "sales_category_intensity": 0.35,
+    "sales_category_confidence": 0.007,
     ...
   }
 }
