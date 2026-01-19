@@ -4,6 +4,7 @@ Orquestra análise com BERT, gerencia cache e agrega resultados.
 """
 
 from typing import Dict, Any, Tuple, List
+import re
 from ..types.messages import TranscriptionChunk
 from ..models.bert_analyzer import BERTAnalyzer
 from ..models.conversation_context import ConversationContext
@@ -534,6 +535,9 @@ class TextAnalysisService:
         sales_category_ambiguity = None
         sales_category_intensity = None
         sales_category_flags: Dict[str, bool] = {}
+        sales_category_best_score = 0.0
+        sales_category_scores: Dict[str, float] = {}
+        sales_category_top_3: List[Dict[str, float]] = []
         try:
             if Config.SBERT_MODEL_NAME:
                 logger.debug(
@@ -566,6 +570,74 @@ class TextAnalysisService:
                 sales_category_ambiguity = ambiguidade
                 sales_category_intensity = intensidade
                 sales_category_flags = flags
+                sales_category_best_score = max(scores.values()) if scores else 0.0
+                sales_category_scores = scores
+                sales_category_top_3 = [
+                    {"category": cat, "score": round(score, 4)}
+                    for cat, score in sorted(scores.items(), key=lambda x: x[1], reverse=True)[:3]
+                ]
+
+                if sales_category is None:
+                    top_3 = [
+                        (cat, round(score, 4))
+                        for cat, score in sorted(scores.items(), key=lambda x: x[1], reverse=True)[:3]
+                    ]
+                    logger.debug(
+                        "⚠️ [ANÁLISE] Sales category não definida (baixo score)",
+                        meeting_id=chunk.meetingId,
+                        text_preview=chunk.text[:80],
+                        confidence=round(confianca or 0.0, 4),
+                        ambiguity=round(ambiguidade or 0.0, 4),
+                        intensity=round(intensidade or 0.0, 4),
+                        top_3_categories=top_3
+                    )
+
+                    # Fallback: tentar classificação por segmentos quando texto é longo/misto
+                    segments = self._split_for_sales_category(chunk.text)
+                    if len(segments) > 1:
+                        best_segment_score = 0.0
+                        best_segment_result = None
+                        for segment in segments:
+                            seg_cat, seg_conf, seg_scores, seg_amb, seg_int, seg_flags = analyzer.classify_sales_category(
+                                segment,
+                                min_confidence=0.0
+                            )
+                            if not seg_scores:
+                                continue
+                            seg_best_score = max(seg_scores.values())
+                            if seg_best_score > best_segment_score:
+                                best_segment_score = seg_best_score
+                                best_segment_result = (
+                                    seg_cat, seg_conf, seg_scores, seg_amb, seg_int, seg_flags, segment
+                                )
+
+                        if best_segment_result:
+                            seg_cat, seg_conf, seg_scores, seg_amb, seg_int, seg_flags, segment = best_segment_result
+                            is_indecision = seg_cat in ['stalling', 'objection_soft']
+                            if is_indecision and best_segment_score >= 0.15 and (seg_int or 0.0) >= 0.25:
+                                logger.info(
+                                    "✅ [ANÁLISE] Fallback por segmento ativado (indecisão detectada)",
+                                    meeting_id=chunk.meetingId,
+                                    text_preview=chunk.text[:80],
+                                    segment_preview=segment[:80],
+                                    category=seg_cat,
+                                    best_score=round(best_segment_score, 4),
+                                    confidence=round(seg_conf or 0.0, 4),
+                                    ambiguity=round(seg_amb or 0.0, 4),
+                                    intensity=round(seg_int or 0.0, 4)
+                                )
+
+                                sales_category = seg_cat
+                                sales_category_confidence = seg_conf
+                                sales_category_ambiguity = seg_amb
+                                sales_category_intensity = seg_int
+                                sales_category_flags = seg_flags
+                                sales_category_best_score = best_segment_score
+                                sales_category_scores = seg_scores
+                                sales_category_top_3 = [
+                                    {"category": cat, "score": round(score, 4)}
+                                    for cat, score in sorted(seg_scores.items(), key=lambda x: x[1], reverse=True)[:3]
+                                ]
                 
                 if sales_category:
                     # Construir reasoning detalhado para logs explicáveis
@@ -596,7 +668,7 @@ class TextAnalysisService:
                     )
                 else:
                     # Construir reasoning para caso sem categoria detectada
-                    best_score = max(scores.values()) if scores else 0.0
+                    best_score = sales_category_best_score
                     reasoning = {
                         "why": "No category met minimum confidence threshold",
                         "reason": f"Best score {round(best_score, 2)} < {0.15}",
@@ -626,6 +698,9 @@ class TextAnalysisService:
             sales_category_ambiguity = None
             sales_category_intensity = None
             sales_category_flags = {}
+            sales_category_best_score = 0.0
+            sales_category_scores = {}
+            sales_category_top_3 = []
 
         # ========================================================================
         # (Opcional) Reformulação do cliente ("solução foi compreendida")
@@ -819,6 +894,9 @@ class TextAnalysisService:
             'sales_category_intensity': sales_category_intensity,
             'sales_category_ambiguity': sales_category_ambiguity,
             'sales_category_flags': sales_category_flags,
+            'sales_category_best_score': sales_category_best_score,
+            'sales_category_scores': sales_category_scores,
+            'sales_category_top_3': sales_category_top_3,
             # Análises contextuais (baseadas em histórico)
             'sales_category_aggregated': sales_category_aggregated,
             'sales_category_transition': sales_category_transition,
@@ -909,6 +987,17 @@ class TextAnalysisService:
         if has_question:
             return ('ask_question', 0.6)
         return ('statement', 0.5)
+
+    def _split_for_sales_category(self, text: str) -> List[str]:
+        if not text:
+            return []
+        # Dividir por pontuação e novas linhas; manter segmentos mínimos para evitar ruído
+        parts = [p.strip() for p in re.split(r'[.!?;:\n]+', text) if p.strip()]
+        segments = [p for p in parts if len(p.split()) >= 3 and len(p) >= 12]
+        # Limitar para reduzir custo
+        if len(segments) > 6:
+            segments = segments[-6:]
+        return segments
     
     def _detect_topic(self, text: str, keywords: List[str]) -> Tuple[str, float]:
         """

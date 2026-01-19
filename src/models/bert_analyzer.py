@@ -1685,6 +1685,7 @@ class BERTAnalyzer:
             
             # Verificar se o score da melhor categoria atinge o mínimo necessário
             if best_score < min_confidence:
+                sorted_top = sorted_categories[:3]
                 logger.debug(
                     "Best category score below minimum confidence threshold",
                     best_category=best_category,
@@ -1693,7 +1694,11 @@ class BERTAnalyzer:
                     ambiguity=round(ambiguity, 4),
                     intensity=round(intensity, 4),
                     flags=flags,
-                    text_preview=text[:50]
+                    text_preview=text[:50],
+                    top_3_categories=[
+                        (cat, round(score, 4))
+                        for cat, score in sorted_top
+                    ]
                 )
                 return None, 0.0, category_scores, ambiguity, intensity, flags
             
