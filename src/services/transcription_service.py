@@ -407,6 +407,14 @@ class TranscriptionService:
                                     filtered_segments.append(seg)
                                 else:
                                     filtered_count += 1
+
+                            used_unfiltered_segments = False
+                            # Se o filtro removeu TUDO mas o Whisper retornou segmentos, preferimos
+                            # retornar os segmentos originais ao invés de "sumir" com o texto.
+                            # Isso evita falsos "segments_count=0" que quebram o pipeline no fim da conversa.
+                            if len(segments_list) > 0 and len(filtered_segments) == 0:
+                                used_unfiltered_segments = True
+                                filtered_segments = segments_list
                             
                             # Construir texto completo concatenando apenas segmentos filtrados
                             text = " ".join(seg.text for seg in filtered_segments).strip()
@@ -441,6 +449,8 @@ class TranscriptionService:
                                 'language': info.language if hasattr(info, 'language') else language_ref,
                                 'language_probability': getattr(info, 'language_probability', 1.0),
                                 'segments': segments_dict,
+                                '_raw_segments_count': len(segments_list),
+                                '_used_unfiltered_segments': used_unfiltered_segments,
                                 'duration': getattr(info, 'duration', len(audio_ref) / sample_rate_ref)
                             }
                         except Exception as e:
@@ -504,6 +514,8 @@ class TranscriptionService:
             text = text_raw.strip()
             detected_language = result.get('language', language or self.language)
             segments = result.get('segments', [])
+            raw_segments_count = int(result.get('_raw_segments_count', len(segments) if isinstance(segments, list) else 0))
+            used_unfiltered_segments = bool(result.get('_used_unfiltered_segments', False))
             
             # Log detalhado quando texto é extraído mas está vazio
             if not text and text_raw:
@@ -520,6 +532,83 @@ class TranscriptionService:
                     segments_count=len(segments),
                     reason="Whisper não detectou nenhum texto transcrito - possible causes: silence only, audio too short, low quality"
                 )
+
+                # Retry automático: se o Whisper entregou zero segmentos/texto vazio, repetir com
+                # VAD desligado e thresholds mais permissivos, porque isso acontece frequentemente
+                # no fim de conversas longas (ruído + sobreposição de vozes).
+                retry_options = transcribe_options.copy()
+                retry_options.update({
+                    'vad_filter': False,
+                    'no_speech_threshold': 0.8,
+                    'log_prob_threshold': -2.0,
+                })
+
+                logger.warn(
+                    "🔁 [TRANSCRIÇÃO] Retry por texto vazio/0 segmentos (modo permissivo)",
+                    original_segments_count=len(segments),
+                    original_raw_segments_count=raw_segments_count,
+                    original_used_unfiltered_segments=used_unfiltered_segments,
+                    audio_length_sec=round(audio_duration_sec_after_trim, 2),
+                )
+
+                async with self._transcription_semaphore:
+                    self._active_transcriptions += 1
+                    try:
+                        model_ref = self.model
+                        audio_ref = audio_array.copy()
+                        options_ref = retry_options.copy()
+                        language_ref = language or self.language
+                        sample_rate_ref = preprocess_result['sample_rate']
+
+                        def transcribe_sync_retry():
+                            segments, info = model_ref.transcribe(audio_ref, **options_ref)
+                            segments_list = list(segments)
+                            # No retry, não aplicar filtro P3.1 (é justamente o que pode zerar tudo)
+                            text_retry = " ".join(seg.text for seg in segments_list).strip()
+                            text_retry = self._fix_common_transcription_errors(text_retry)
+                            segments_dict_retry = [{
+                                'start': seg.start,
+                                'end': seg.end,
+                                'text': seg.text,
+                                'no_speech_prob': getattr(seg, 'no_speech_prob', 0.0),
+                                'compression_ratio': getattr(seg, 'compression_ratio', 0.0),
+                                'avg_logprob': getattr(seg, 'avg_logprob', 0.0),
+                            } for seg in segments_list]
+                            return {
+                                'text': text_retry,
+                                'language': info.language if hasattr(info, 'language') else language_ref,
+                                'segments': segments_dict_retry,
+                                '_raw_segments_count': len(segments_list),
+                                '_used_unfiltered_segments': True,
+                            }
+
+                        task = loop.run_in_executor(self._executor, transcribe_sync_retry)
+                        retry_result = await asyncio.wait_for(task, timeout=30.0)
+                        # Sobrescrever o resultado se o retry trouxe texto
+                        retry_text = (retry_result.get('text', '') or '').strip()
+                        retry_segments = retry_result.get('segments', []) or []
+                        if retry_text:
+                            result = retry_result
+                            text_raw = result.get('text', '')
+                            text = text_raw.strip()
+                            detected_language = result.get('language', detected_language)
+                            segments = retry_segments
+                            raw_segments_count = int(result.get('_raw_segments_count', len(segments)))
+                            used_unfiltered_segments = bool(result.get('_used_unfiltered_segments', True))
+                            logger.info(
+                                "✅ [TRANSCRIÇÃO] Retry recuperou texto",
+                                text_length=len(text),
+                                segments_count=len(segments),
+                                raw_segments_count=raw_segments_count,
+                            )
+                    except Exception as retry_error:
+                        logger.warn(
+                            "⚠️ [TRANSCRIÇÃO] Retry falhou",
+                            error=str(retry_error),
+                            error_type=type(retry_error).__name__,
+                        )
+                    finally:
+                        self._active_transcriptions -= 1
             
             # Calcular confiança média dos segmentos (após filtro P3.1)
             confidence = 0.0
@@ -561,6 +650,29 @@ class TranscriptionService:
             )
             
             if confidence < min_confidence or repetition_ratio > max_repetition_ratio:
+                # Não descartar texto útil que contém sinais claros de indecisão.
+                # Isso é crucial no fim de conversas longas, onde a qualidade do áudio tende a piorar.
+                text_lower = text.lower() if text else ''
+                indecision_lexicon = [
+                    'adiar', 'depois', 'talvez', 'preciso pensar', 'vamos ver',
+                    'por enquanto', 'não sei', 'ainda não', 'mais tarde', 'pensar melhor',
+                ]
+                has_indecision_lexicon = any(tok in text_lower for tok in indecision_lexicon)
+                if text and repetition_ratio <= max_repetition_ratio and has_indecision_lexicon:
+                    logger.warn(
+                        "⚠️ [TRANSCRIÇÃO] Mantendo texto apesar de baixa confiança (léxico de indecisão)",
+                        confidence=round(confidence, 3),
+                        min_confidence=min_confidence,
+                        text_preview=text[:100],
+                        segments_count=len(segments),
+                    )
+                    return {
+                        'text': text,
+                        'language': detected_language,
+                        'segments': segments,
+                        'confidence': confidence
+                    }
+
                 logger.warn(
                     "⚠️ [TRANSCRIÇÃO] Texto rejeitado por baixa qualidade",
                     confidence=round(confidence, 3),
