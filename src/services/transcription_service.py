@@ -976,6 +976,7 @@ class TranscriptionService:
             }
         """
         try:
+            failure_reason = None
             # Decodificar WAV para array numpy
             # O Whisper espera áudio como array numpy float32 normalizado (-1 a 1)
             audio_array = self._decode_wav(audio_data, sample_rate)
@@ -1004,13 +1005,23 @@ class TranscriptionService:
             # Evita alucinações do Whisper em áudio silencioso ou muito quieto
             has_speech = self._has_speech_rms(audio_array, sample_rate)
             if not has_speech:
+                failure_reason = "no_speech_rms"
                 logger.debug(
                     "⏭️ [PRÉ-PROCESSAMENTO] RMS não detectou fala",
                     audio_duration_sec=round(audio_duration_sec, 3),
                     sample_rate=sample_rate,
                     reason="has_speech_rms retornou False - possível silêncio apenas"
                 )
-                return None
+                # Fallback para buffers longos: evitar descartar conversa no fim
+                if audio_duration_sec >= 5.0:
+                    logger.warn(
+                        "⚠️ [PRÉ-PROCESSAMENTO] Fallback ativado (RMS sem fala, buffer longo)",
+                        audio_duration_sec=round(audio_duration_sec, 3),
+                        sample_rate=sample_rate,
+                        reason=failure_reason
+                    )
+                else:
+                    return None
             
             # P1.3: Trim de silêncio inicial/final - remove silêncio que causa alucinações
             audio_array, trim_info = self._trim_silence(audio_array, sample_rate)
@@ -1021,6 +1032,7 @@ class TranscriptionService:
             audio_duration_sec_after_trim = len(audio_array) / sample_rate
             min_audio_after_trim_sec = 0.8  # REVISADO: Reduzido de 1.5s para 0.8s (era 0.5s antes de P4.2)
             if audio_duration_sec_after_trim < min_audio_after_trim_sec:
+                failure_reason = "too_short_after_trim"
                 logger.debug(
                     "⏭️ [PRÉ-PROCESSAMENTO] Áudio muito curto após trim",
                     audio_duration_sec_before_trim=round(audio_duration_sec, 3),
@@ -1030,7 +1042,22 @@ class TranscriptionService:
                     trim_end_sec=trim_info.get('trimmed_end_sec', 0),
                     reason=f"Áudio após trim ({audio_duration_sec_after_trim:.2f}s) menor que mínimo ({min_audio_after_trim_sec}s)"
                 )
-                return None
+                # Fallback para buffers longos: usar áudio original sem trim
+                if audio_duration_sec >= 5.0:
+                    logger.warn(
+                        "⚠️ [PRÉ-PROCESSAMENTO] Fallback ativado (trim reduziu demais)",
+                        audio_duration_sec=round(audio_duration_sec, 3),
+                        audio_duration_sec_after_trim=round(audio_duration_sec_after_trim, 3),
+                        min_audio_after_trim_sec=min_audio_after_trim_sec,
+                        reason=failure_reason
+                    )
+                    audio_array = self._decode_wav(audio_data, sample_rate)
+                    if audio_array is None or len(audio_array) == 0:
+                        return None
+                    trim_info = {'trimmed_start_sec': 0, 'trimmed_end_sec': 0}
+                    audio_duration_sec_after_trim = len(audio_array) / sample_rate
+                else:
+                    return None
             
             # P2.2: Estimar SNR para VAD seletivo e ajuste de parâmetros
             estimated_snr_db = self._estimate_snr(audio_array, sample_rate)
@@ -1058,6 +1085,14 @@ class TranscriptionService:
                 'beam_size': beam_size,  # P2.3: Dinâmico conforme duração (5 para <10s, 7 para ≥10s)
                 'vad_filter': use_vad,  # P2.2: Seletivo baseado em SNR estimado
             }
+
+            # Se o fallback foi ativado, tornar a transcrição mais permissiva
+            if failure_reason in {"no_speech_rms", "too_short_after_trim"}:
+                transcribe_options = {
+                    **transcribe_options,
+                    'no_speech_threshold': 0.8,
+                    'vad_filter': False,
+                }
             
             return {
                 'audio_array': audio_array,
