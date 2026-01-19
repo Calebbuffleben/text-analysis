@@ -8,7 +8,8 @@ import structlog
 import base64
 import time
 import os
-from typing import Dict, Any
+import asyncio
+from typing import Dict, Any, Optional, Tuple
 from .config import Config
 from .types.messages import TranscriptionChunk, TextAnalysisResult, AudioChunk
 from .services.analysis_service import TextAnalysisService
@@ -17,23 +18,8 @@ from .services.audio_buffer_service import AudioBufferService
 
 logger = structlog.get_logger()
 
-# Inicializar serviços
-analysis_service = TextAnalysisService()
-
-# Inicializar TranscriptionService com tratamento de erro
-# Se faster-whisper não estiver disponível, o serviço ainda pode iniciar
-# mas a transcrição de áudio não funcionará
-try:
-    transcription_service = TranscriptionService()
-    logger.info("✅ [SOCKET.IO] TranscriptionService inicializado com sucesso")
-except Exception as e:
-    logger.error(
-        "❌ [CRITICAL] Falha ao inicializar TranscriptionService. Serviço continuará sem transcrição de áudio.",
-        error=str(e),
-        error_type=type(e).__name__,
-        note="O serviço Python continuará funcionando, mas transcrição de áudio estará desabilitada"
-    )
-    transcription_service = None  # type: ignore
+analysis_service: Optional[TextAnalysisService] = None
+transcription_service: Optional[TranscriptionService] = None
 
 # Buffer de áudio (tunable via env para facilitar testes manuais)
 def _env_float(name: str, default: float) -> float:
@@ -54,8 +40,58 @@ audio_buffer_service = AudioBufferService(
     flush_interval_sec=_env_float('AUDIO_BUFFER_FLUSH_INTERVAL_SEC', 2.0),
 )
 
+AudioKey = Tuple[str, str, str]  # (meeting_id, participant_id, track)
+
+# Backpressure: para evitar "parar depois de alguns minutos", mantemos no máximo 1 job pendente por participante/track.
+# Em calls longas com múltiplos participantes, o Whisper fica serializado (semaphore=1) e a fila cresce.
+# Aqui nós "coalescemos" jobs: sempre processar o mais recente e descartar intermediários.
+_latest_job_by_key: Dict[AudioKey, Dict[str, Any]] = {}
+_runner_by_key: Dict[AudioKey, asyncio.Task] = {}
+_dropped_jobs_by_key: Dict[AudioKey, int] = {}
+
+async def _run_key_queue(key: AudioKey):
+    while True:
+        job = _latest_job_by_key.pop(key, None)
+        if job is None:
+            return
+        await on_buffer_ready(**job)
+
+def _schedule_buffer_job(
+    meeting_id: str,
+    participant_id: str,
+    track: str,
+    wav_data: bytes,
+    sample_rate: int,
+    channels: int,
+    timestamp: int,
+):
+    key: AudioKey = (meeting_id, participant_id, track)
+    if key in _latest_job_by_key:
+        _dropped_jobs_by_key[key] = _dropped_jobs_by_key.get(key, 0) + 1
+        logger.warn(
+            "🧹 [BACKPRESSURE] Substituindo job pendente (descartando intermediário)",
+            meeting_id=meeting_id,
+            participant_id=participant_id,
+            track=track,
+            dropped=_dropped_jobs_by_key.get(key, 0),
+        )
+
+    _latest_job_by_key[key] = {
+        'meeting_id': meeting_id,
+        'participant_id': participant_id,
+        'track': track,
+        'wav_data': wav_data,
+        'sample_rate': sample_rate,
+        'channels': channels,
+        'timestamp': timestamp,
+    }
+    task = _runner_by_key.get(key)
+    if task is None or task.done():
+        _runner_by_key[key] = asyncio.create_task(_run_key_queue(key))
+
+
 # Configurar callback para quando buffer estiver pronto
-async def on_buffer_ready(meeting_id: str, participant_id: str, track: str, 
+async def on_buffer_ready(meeting_id: str, participant_id: str, track: str,
                          wav_data: bytes, sample_rate: int, channels: int, timestamp: int):
     """Callback chamado quando buffer está pronto para transcrição"""
     try:
@@ -137,7 +173,19 @@ async def on_buffer_ready(meeting_id: str, participant_id: str, track: str,
             error_type=type(e).__name__
         )
 
-audio_buffer_service.set_callback(on_buffer_ready)
+async def on_buffer_ready_enqueue(meeting_id: str, participant_id: str, track: str,
+                                 wav_data: bytes, sample_rate: int, channels: int, timestamp: int):
+    _schedule_buffer_job(
+        meeting_id=meeting_id,
+        participant_id=participant_id,
+        track=track,
+        wav_data=wav_data,
+        sample_rate=sample_rate,
+        channels=channels,
+        timestamp=timestamp,
+    )
+
+audio_buffer_service.set_callback(on_buffer_ready_enqueue)
 
 # Criar servidor Socket.IO
 # Configurações para melhor compatibilidade com Railway e polling HTTP
@@ -170,7 +218,17 @@ app = socketio.ASGIApp(sio)
 # Instanciar serviços (singletons)
 logger.info("🔄 [SOCKET.IO] Inicializando serviços...")
 analysis_service = TextAnalysisService()
-transcription_service = TranscriptionService()
+try:
+    transcription_service = TranscriptionService()
+    logger.info("✅ [SOCKET.IO] TranscriptionService inicializado com sucesso")
+except Exception as e:
+    logger.error(
+        "❌ [CRITICAL] Falha ao inicializar TranscriptionService. Serviço continuará sem transcrição de áudio.",
+        error=str(e),
+        error_type=type(e).__name__,
+        note="O serviço Python continuará funcionando, mas transcrição de áudio estará desabilitada"
+    )
+    transcription_service = None
 logger.info("✅ [SOCKET.IO] Serviços inicializados, Socket.IO server pronto")
 
 
@@ -453,7 +511,7 @@ async def audio_chunk(sid, data: Dict[str, Any]):
             )
             return
         
-        # Buffer está pronto imediatamente! Processar via callback
+        # Buffer está pronto imediatamente!
         logger.info(
             "🎙️ [FLUXO] Buffer pronto imediatamente, processando via callback",
             client_id=sid,
@@ -462,15 +520,16 @@ async def audio_chunk(sid, data: Dict[str, Any]):
             audio_size_bytes=len(combined_wav)
         )
         
-        # Processar via callback (que faz transcrição + análise)
-        await on_buffer_ready(
+        # Backpressure: não bloquear o handler aguardando transcrição/análise.
+        # Agendamos o job e coalescemos se chegar mais áudio (sempre processar o mais recente).
+        _schedule_buffer_job(
             meeting_id=meeting_id,
             participant_id=participant_id,
             track=track,
             wav_data=combined_wav,
             sample_rate=sample_rate,
             channels=channels,
-            timestamp=timestamp
+            timestamp=timestamp,
         )
         
         return
