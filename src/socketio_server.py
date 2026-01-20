@@ -8,7 +8,7 @@ import structlog
 import base64
 import time
 import os
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from .config import Config
 from .types.messages import TranscriptionChunk, TextAnalysisResult, AudioChunk
 from .services.analysis_service import TextAnalysisService
@@ -17,23 +17,9 @@ from .services.audio_buffer_service import AudioBufferService
 
 logger = structlog.get_logger()
 
-# Inicializar serviços
-analysis_service = TextAnalysisService()
-
-# Inicializar TranscriptionService com tratamento de erro
-# Se faster-whisper não estiver disponível, o serviço ainda pode iniciar
-# mas a transcrição de áudio não funcionará
-try:
-    transcription_service = TranscriptionService()
-    logger.info("✅ [SOCKET.IO] TranscriptionService inicializado com sucesso")
-except Exception as e:
-    logger.error(
-        "❌ [CRITICAL] Falha ao inicializar TranscriptionService. Serviço continuará sem transcrição de áudio.",
-        error=str(e),
-        error_type=type(e).__name__,
-        note="O serviço Python continuará funcionando, mas transcrição de áudio estará desabilitada"
-    )
-    transcription_service = None  # type: ignore
+# Serviços serão inicializados posteriormente (evita crash durante import)
+analysis_service: Optional[TextAnalysisService] = None
+transcription_service: Optional[TranscriptionService] = None
 
 # Buffer de áudio (tunable via env para facilitar testes manuais)
 def _env_float(name: str, default: float) -> float:
@@ -103,6 +89,9 @@ async def on_buffer_ready(meeting_id: str, participant_id: str, track: str,
         )
         
         # Analisar texto com BERT
+        if analysis_service is None:
+            logger.error("❌ [BUFFER] AnalysisService não disponível")
+            return
         analysis_result = await analysis_service.analyze(chunk)
         
         # Criar resposta
@@ -169,7 +158,17 @@ app = socketio.ASGIApp(sio)
 # Instanciar serviços (singletons)
 logger.info("🔄 [SOCKET.IO] Inicializando serviços...")
 analysis_service = TextAnalysisService()
-transcription_service = TranscriptionService()
+try:
+    transcription_service = TranscriptionService()
+    logger.info("✅ [SOCKET.IO] TranscriptionService inicializado com sucesso")
+except Exception as e:
+    logger.error(
+        "❌ [CRITICAL] Falha ao inicializar TranscriptionService. Serviço continuará sem transcrição de áudio.",
+        error=str(e),
+        error_type=type(e).__name__,
+        note="O serviço Python continuará funcionando, mas transcrição de áudio estará desabilitada"
+    )
+    transcription_service = None
 logger.info("✅ [SOCKET.IO] Serviços inicializados, Socket.IO server pronto")
 
 
@@ -284,6 +283,9 @@ async def transcription_chunk(sid, data: Dict[str, Any]):
             participant_id=participant_id,
             text_length=len(chunk.text)
         )
+        if analysis_service is None:
+            logger.error("❌ [FLUXO] AnalysisService não disponível")
+            return
         analysis_result = await analysis_service.analyze(chunk)
         
         logger.debug(
@@ -605,6 +607,9 @@ async def audio_chunk(sid, data: Dict[str, Any]):
             participant_id=participant_id,
             text_length=len(text)
         )
+        if analysis_service is None:
+            logger.error("❌ [FLUXO] AnalysisService não disponível")
+            return
         analysis_result = await analysis_service.analyze(chunk)
         
         logger.debug(
