@@ -30,6 +30,9 @@ cachetools==5.3.2
 # HTTP Client (para health checks)
 httpx==0.26.0
 
+# Queue/stream (Deep Path)
+redis==5.0.1
+
 # Transcrição de áudio (faster-whisper - implementação otimizada do Whisper)
 faster-whisper>=1.0.0
 ffmpeg-python==0.2.0
