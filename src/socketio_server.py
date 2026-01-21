@@ -368,27 +368,37 @@ except Exception as e:
     transcription_service = None
 logger.info("✅ [SOCKET.IO] Serviços inicializados, Socket.IO server pronto")
 
-# Start deep queue loop (optional)
-if _deep_queue_enabled and _deep_redis_url:
-    try:
-        loop = asyncio.get_event_loop()
-        loop.create_task(_deep_audio_loop())
+# Deep queue consumer initialization moved to main.py startup event.
+# Do NOT call create_task here at module level - exceptions get silently ignored.
+def start_deep_queue_consumer():
+    """
+    Start deep queue consumer. Must be called from FastAPI startup event.
+    """
+    if not _deep_queue_enabled or not _deep_redis_url:
         logger.info(
-            "✅ [DEEP_QUEUE] Deep audio consumer loop task created",
-            stream=_deep_audio_stream,
+            "⏭️ [DEEP_QUEUE] Deep queue disabled, using direct Socket.IO path",
+            deep_queue_enabled=_deep_queue_enabled,
             redis_url_configured=bool(_deep_redis_url),
         )
-    except Exception as e:
-        logger.error(
-            "❌ [DEEP_QUEUE] CRITICAL: Failed to start deep audio loop - queue will not work!",
-            error=str(e),
-            error_type=type(e).__name__,
-        )
-else:
+        return
+    
+    task = asyncio.create_task(_deep_audio_loop())
+    
+    def on_done(t: asyncio.Task):
+        if t.exception():
+            logger.critical(
+                "💀 [DEEP_QUEUE] Consumer loop terminated with exception",
+                error=str(t.exception()),
+                error_type=type(t.exception()).__name__,
+            )
+        else:
+            logger.warn("⚠️ [DEEP_QUEUE] Consumer loop terminated normally (should run forever)")
+    
+    task.add_done_callback(on_done)
+    
     logger.info(
-        "⏭️ [DEEP_QUEUE] Deep queue disabled, using direct Socket.IO path",
-        deep_queue_enabled=_deep_queue_enabled,
-        redis_url_configured=bool(_deep_redis_url),
+        "✅ [DEEP_QUEUE] Deep audio consumer task scheduled with error tracking",
+        stream=_deep_audio_stream,
     )
 
 
