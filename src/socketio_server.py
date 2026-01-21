@@ -59,18 +59,31 @@ async def _ensure_deep_group(r: redis.Redis):
         # group may already exist
         pass
 
+_deep_loop_consecutive_errors = 0
+_deep_loop_max_consecutive_errors = 10
+
 async def _deep_audio_loop():
-    global _deep_redis
+    global _deep_redis, _deep_loop_consecutive_errors
     if not _deep_queue_enabled or not _deep_redis_url:
         return
-    _deep_redis = redis.from_url(_deep_redis_url, decode_responses=True)
-    await _ensure_deep_group(_deep_redis)
-    logger.info(
-        "✅ [DEEP_QUEUE] Deep audio consumer loop started",
-        stream=_deep_audio_stream,
-        group=_deep_consumer_group,
-        consumer=_deep_consumer_name,
-    )
+    
+    try:
+        _deep_redis = redis.from_url(_deep_redis_url, decode_responses=True)
+        await _ensure_deep_group(_deep_redis)
+        logger.info(
+            "✅ [DEEP_QUEUE] Deep audio consumer loop started",
+            stream=_deep_audio_stream,
+            group=_deep_consumer_group,
+            consumer=_deep_consumer_name,
+        )
+    except Exception as e:
+        logger.error(
+            "❌ [DEEP_QUEUE] CRITICAL: Failed to initialize Redis connection",
+            error=str(e),
+            error_type=type(e).__name__,
+            redis_url_configured=bool(_deep_redis_url),
+        )
+        return
 
     while True:
         try:
@@ -81,6 +94,10 @@ async def _deep_audio_loop():
                 count=1,
                 block=2000,
             )
+            
+            # Reset error counter on successful read
+            _deep_loop_consecutive_errors = 0
+            
             if not resp:
                 continue
             # resp format: [(stream, [(id, {field: value})])]\n
@@ -113,11 +130,23 @@ async def _deep_audio_loop():
 
             await _deep_redis.xack(_deep_audio_stream, _deep_consumer_group, entry_id)
         except Exception as e:
-            logger.warn(
-                "⚠️ [DEEP_QUEUE] Error in deep audio loop",
+            _deep_loop_consecutive_errors += 1
+            logger.error(
+                "❌ [DEEP_QUEUE] Error in deep audio loop",
                 error=str(e),
                 error_type=type(e).__name__,
+                consecutive_errors=_deep_loop_consecutive_errors,
+                max_allowed=_deep_loop_max_consecutive_errors,
             )
+            
+            if _deep_loop_consecutive_errors >= _deep_loop_max_consecutive_errors:
+                logger.critical(
+                    "💀 [DEEP_QUEUE] FATAL: Too many consecutive errors, exiting consumer loop",
+                    consecutive_errors=_deep_loop_consecutive_errors,
+                    note="Service will continue but deep queue will not process audio",
+                )
+                return
+            
             await asyncio.sleep(1.0)
 
 AudioKey = Tuple[str, str, str]  # (meeting_id, participant_id, track)
@@ -232,28 +261,39 @@ async def on_buffer_ready(meeting_id: str, participant_id: str, track: str,
             confidence=confidence
         )
         
-        # Enviar resultado via Socket.IO
-        # Nota: Precisamos encontrar o sid correto para este participante
-        # Por enquanto, enviaremos para todos os clientes conectados
         result_dict = result.model_dump()
-        await sio.emit('text_analysis_result', result_dict)
-
-        # Optional: publish analysis results to Redis stream for backend consumption (decoupled deep path).
+        
+        # Escolher um caminho: Redis (queue) OU Socket.IO (direct), não ambos
         if _deep_queue_enabled and _deep_redis_url:
+            # Queue path: publish to Redis only
             try:
                 if _deep_redis is None:
                     # create a client lazily; group creation not required for producer
                     # decode_responses=True because we store JSON string
                     globals()['_deep_redis'] = redis.from_url(_deep_redis_url, decode_responses=True)
                 await _deep_redis.xadd(_deep_results_stream, {'json': json.dumps(result_dict)}, maxlen=20000, approximate=True)
+                logger.debug(
+                    "✅ [DEEP_QUEUE] Result published to Redis stream",
+                    meeting_id=meeting_id,
+                    participant_id=participant_id,
+                    stream=_deep_results_stream,
+                )
             except Exception as e:
-                logger.warn(
-                    "⚠️ [DEEP_QUEUE] Failed to publish deep result",
+                logger.error(
+                    "❌ [DEEP_QUEUE] Failed to publish deep result to Redis",
                     error=str(e),
                     error_type=type(e).__name__,
                     meeting_id=meeting_id,
                     participant_id=participant_id,
                 )
+        else:
+            # Direct path: emit via Socket.IO
+            await sio.emit('text_analysis_result', result_dict)
+            logger.debug(
+                "✅ [SOCKET.IO] Result emitted via Socket.IO",
+                meeting_id=meeting_id,
+                participant_id=participant_id,
+            )
         
         logger.info(
             "✅ [BUFFER] Análise de áudio agrupado concluída e enviada",
@@ -329,14 +369,26 @@ except Exception as e:
 logger.info("✅ [SOCKET.IO] Serviços inicializados, Socket.IO server pronto")
 
 # Start deep queue loop (optional)
-try:
-    loop = asyncio.get_event_loop()
-    loop.create_task(_deep_audio_loop())
-except Exception as e:
-    logger.warn(
-        "⚠️ [DEEP_QUEUE] Failed to start deep audio loop",
-        error=str(e),
-        error_type=type(e).__name__,
+if _deep_queue_enabled and _deep_redis_url:
+    try:
+        loop = asyncio.get_event_loop()
+        loop.create_task(_deep_audio_loop())
+        logger.info(
+            "✅ [DEEP_QUEUE] Deep audio consumer loop task created",
+            stream=_deep_audio_stream,
+            redis_url_configured=bool(_deep_redis_url),
+        )
+    except Exception as e:
+        logger.error(
+            "❌ [DEEP_QUEUE] CRITICAL: Failed to start deep audio loop - queue will not work!",
+            error=str(e),
+            error_type=type(e).__name__,
+        )
+else:
+    logger.info(
+        "⏭️ [DEEP_QUEUE] Deep queue disabled, using direct Socket.IO path",
+        deep_queue_enabled=_deep_queue_enabled,
+        redis_url_configured=bool(_deep_redis_url),
     )
 
 
