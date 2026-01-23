@@ -83,6 +83,16 @@ fastapi_app = FastAPI(
     version="1.0.0"
 )
 
+@fastapi_app.on_event("startup")
+async def startup_event():
+    """
+    FastAPI startup event - initialize deep queue consumer here.
+    """
+    from .socketio_server import start_deep_queue_consumer
+    logger.info("🚀 [STARTUP] FastAPI startup event - initializing deep queue consumer...")
+    start_deep_queue_consumer()
+    logger.info("✅ [STARTUP] Startup event complete")
+
 # Configurar CORS para permitir requisições HTTP de polling do Socket.IO
 fastapi_app.add_middleware(
     CORSMiddleware,

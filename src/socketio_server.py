@@ -8,7 +8,10 @@ import structlog
 import base64
 import time
 import os
-from typing import Dict, Any, Optional
+import asyncio
+from typing import Dict, Any, Optional, Tuple
+import json
+import redis.asyncio as redis
 from .config import Config
 from .types.messages import TranscriptionChunk, TextAnalysisResult, AudioChunk
 from .services.analysis_service import TextAnalysisService
@@ -17,7 +20,6 @@ from .services.audio_buffer_service import AudioBufferService
 
 logger = structlog.get_logger()
 
-# Serviços serão inicializados posteriormente (evita crash durante import)
 analysis_service: Optional[TextAnalysisService] = None
 transcription_service: Optional[TranscriptionService] = None
 
@@ -32,15 +34,173 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 audio_buffer_service = AudioBufferService(
-    # Default 5s: bom equilíbrio para tempo real, mas pode cortar frases no meio.
+    # P4.1: Buffer mínimo aumentado para 7s - contexto maior reduz alucinações do Whisper
+    # Trade-off: Latência ligeiramente maior, mas melhora significativa na precisão
     # Para testes manuais, experimente 8-10s para reduzir truncamento de frases.
-    min_duration_sec=_env_float('AUDIO_BUFFER_MIN_DURATION_SEC', 5.0),
+    min_duration_sec=_env_float('AUDIO_BUFFER_MIN_DURATION_SEC', 7.0),  # P4.1: Aumentado de 5.0s para 7.0s
     max_duration_sec=_env_float('AUDIO_BUFFER_MAX_DURATION_SEC', 10.0),
     flush_interval_sec=_env_float('AUDIO_BUFFER_FLUSH_INTERVAL_SEC', 2.0),
 )
 
+# Deep queue (optional): backend can enqueue WAV jobs into Redis Streams to decouple ingestion from Whisper.
+_deep_queue_enabled = os.getenv('DEEP_QUEUE_ENABLED', 'false').lower() == 'true'
+_deep_redis_url = os.getenv('DEEP_REDIS_URL') or os.getenv('REDIS_URL') or ''
+_deep_audio_stream = os.getenv('DEEP_AUDIO_STREAM_KEY', 'deep:audio_jobs')
+_deep_consumer_group = os.getenv('DEEP_AUDIO_CONSUMER_GROUP', 'deep_audio_workers')
+_deep_consumer_name = os.getenv('DEEP_AUDIO_CONSUMER_NAME', f'worker-{os.getpid()}')
+
+_deep_redis: Optional[redis.Redis] = None
+_deep_results_stream = os.getenv('DEEP_RESULTS_STREAM_KEY', 'deep:text_results')
+
+async def _ensure_deep_group(r: redis.Redis):
+    try:
+        await r.xgroup_create(_deep_audio_stream, _deep_consumer_group, id='0-0', mkstream=True)
+    except Exception:
+        # group may already exist
+        pass
+
+_deep_loop_consecutive_errors = 0
+_deep_loop_max_consecutive_errors = 10
+
+async def _deep_audio_loop():
+    global _deep_redis, _deep_loop_consecutive_errors
+    if not _deep_queue_enabled or not _deep_redis_url:
+        return
+    
+    try:
+        _deep_redis = redis.from_url(_deep_redis_url, decode_responses=True)
+        await _ensure_deep_group(_deep_redis)
+        logger.info(
+            "✅ [DEEP_QUEUE] Deep audio consumer loop started",
+            stream=_deep_audio_stream,
+            group=_deep_consumer_group,
+            consumer=_deep_consumer_name,
+        )
+    except Exception as e:
+        logger.error(
+            "❌ [DEEP_QUEUE] CRITICAL: Failed to initialize Redis connection",
+            error=str(e),
+            error_type=type(e).__name__,
+            redis_url_configured=bool(_deep_redis_url),
+        )
+        return
+
+    while True:
+        try:
+            resp = await _deep_redis.xreadgroup(
+                groupname=_deep_consumer_group,
+                consumername=_deep_consumer_name,
+                streams={_deep_audio_stream: '>'},
+                count=1,
+                block=2000,
+            )
+            
+            # Reset error counter on successful read
+            _deep_loop_consecutive_errors = 0
+            
+            if not resp:
+                continue
+            # resp format: [(stream, [(id, {field: value})])]\n
+            _, entries = resp[0]
+            entry_id, fields = entries[0]
+            wav_b64 = fields.get('wavBase64') or ''
+            meeting_id = fields.get('meetingId') or ''
+            participant_id = fields.get('participantId') or ''
+            track = fields.get('track') or 'webrtc-audio'
+            sample_rate = int(fields.get('sampleRate') or '16000')
+            channels = int(fields.get('channels') or '1')
+            ts_capture = int(fields.get('tsCaptureMs') or str(int(time.time() * 1000)))
+
+            if not wav_b64 or not meeting_id or not participant_id:
+                await _deep_redis.xack(_deep_audio_stream, _deep_consumer_group, entry_id)
+                continue
+
+            wav_bytes = base64.b64decode(wav_b64)
+
+            # Backpressure coalescing happens inside on_buffer_ready via our scheduler.
+            _schedule_buffer_job(
+                meeting_id=meeting_id,
+                participant_id=participant_id,
+                track=track,
+                wav_data=wav_bytes,
+                sample_rate=sample_rate,
+                channels=channels,
+                timestamp=ts_capture,
+            )
+
+            await _deep_redis.xack(_deep_audio_stream, _deep_consumer_group, entry_id)
+        except Exception as e:
+            _deep_loop_consecutive_errors += 1
+            logger.error(
+                "❌ [DEEP_QUEUE] Error in deep audio loop",
+                error=str(e),
+                error_type=type(e).__name__,
+                consecutive_errors=_deep_loop_consecutive_errors,
+                max_allowed=_deep_loop_max_consecutive_errors,
+            )
+            
+            if _deep_loop_consecutive_errors >= _deep_loop_max_consecutive_errors:
+                logger.critical(
+                    "💀 [DEEP_QUEUE] FATAL: Too many consecutive errors, exiting consumer loop",
+                    consecutive_errors=_deep_loop_consecutive_errors,
+                    note="Service will continue but deep queue will not process audio",
+                )
+                return
+            
+            await asyncio.sleep(1.0)
+
+AudioKey = Tuple[str, str, str]  # (meeting_id, participant_id, track)
+
+# Backpressure: para evitar "parar depois de alguns minutos", mantemos no máximo 1 job pendente por participante/track.
+# Em calls longas com múltiplos participantes, o Whisper fica serializado (semaphore=1) e a fila cresce.
+# Aqui nós "coalescemos" jobs: sempre processar o mais recente e descartar intermediários.
+_latest_job_by_key: Dict[AudioKey, Dict[str, Any]] = {}
+_runner_by_key: Dict[AudioKey, asyncio.Task] = {}
+_dropped_jobs_by_key: Dict[AudioKey, int] = {}
+
+async def _run_key_queue(key: AudioKey):
+    while True:
+        job = _latest_job_by_key.pop(key, None)
+        if job is None:
+            return
+        await on_buffer_ready(**job)
+
+def _schedule_buffer_job(
+    meeting_id: str,
+    participant_id: str,
+    track: str,
+    wav_data: bytes,
+    sample_rate: int,
+    channels: int,
+    timestamp: int,
+):
+    key: AudioKey = (meeting_id, participant_id, track)
+    if key in _latest_job_by_key:
+        _dropped_jobs_by_key[key] = _dropped_jobs_by_key.get(key, 0) + 1
+        logger.warn(
+            "🧹 [BACKPRESSURE] Substituindo job pendente (descartando intermediário)",
+            meeting_id=meeting_id,
+            participant_id=participant_id,
+            track=track,
+            dropped=_dropped_jobs_by_key.get(key, 0),
+        )
+
+    _latest_job_by_key[key] = {
+        'meeting_id': meeting_id,
+        'participant_id': participant_id,
+        'track': track,
+        'wav_data': wav_data,
+        'sample_rate': sample_rate,
+        'channels': channels,
+        'timestamp': timestamp,
+    }
+    task = _runner_by_key.get(key)
+    if task is None or task.done():
+        _runner_by_key[key] = asyncio.create_task(_run_key_queue(key))
+
+
 # Configurar callback para quando buffer estiver pronto
-async def on_buffer_ready(meeting_id: str, participant_id: str, track: str, 
+async def on_buffer_ready(meeting_id: str, participant_id: str, track: str,
                          wav_data: bytes, sample_rate: int, channels: int, timestamp: int):
     """Callback chamado quando buffer está pronto para transcrição"""
     try:
@@ -104,11 +264,39 @@ async def on_buffer_ready(meeting_id: str, participant_id: str, track: str,
             confidence=confidence
         )
         
-        # Enviar resultado via Socket.IO
-        # Nota: Precisamos encontrar o sid correto para este participante
-        # Por enquanto, enviaremos para todos os clientes conectados
         result_dict = result.model_dump()
-        await sio.emit('text_analysis_result', result_dict)
+        
+        # Escolher um caminho: Redis (queue) OU Socket.IO (direct), não ambos
+        if _deep_queue_enabled and _deep_redis_url:
+            # Queue path: publish to Redis only
+            try:
+                if _deep_redis is None:
+                    # create a client lazily; group creation not required for producer
+                    # decode_responses=True because we store JSON string
+                    globals()['_deep_redis'] = redis.from_url(_deep_redis_url, decode_responses=True)
+                await _deep_redis.xadd(_deep_results_stream, {'json': json.dumps(result_dict)}, maxlen=20000, approximate=True)
+                logger.debug(
+                    "✅ [DEEP_QUEUE] Result published to Redis stream",
+                    meeting_id=meeting_id,
+                    participant_id=participant_id,
+                    stream=_deep_results_stream,
+                )
+            except Exception as e:
+                logger.error(
+                    "❌ [DEEP_QUEUE] Failed to publish deep result to Redis",
+                    error=str(e),
+                    error_type=type(e).__name__,
+                    meeting_id=meeting_id,
+                    participant_id=participant_id,
+                )
+        else:
+            # Direct path: emit via Socket.IO
+            await sio.emit('text_analysis_result', result_dict)
+            logger.debug(
+                "✅ [SOCKET.IO] Result emitted via Socket.IO",
+                meeting_id=meeting_id,
+                participant_id=participant_id,
+            )
         
         logger.info(
             "✅ [BUFFER] Análise de áudio agrupado concluída e enviada",
@@ -125,7 +313,19 @@ async def on_buffer_ready(meeting_id: str, participant_id: str, track: str,
             error_type=type(e).__name__
         )
 
-audio_buffer_service.set_callback(on_buffer_ready)
+async def on_buffer_ready_enqueue(meeting_id: str, participant_id: str, track: str,
+                                 wav_data: bytes, sample_rate: int, channels: int, timestamp: int):
+    _schedule_buffer_job(
+        meeting_id=meeting_id,
+        participant_id=participant_id,
+        track=track,
+        wav_data=wav_data,
+        sample_rate=sample_rate,
+        channels=channels,
+        timestamp=timestamp,
+    )
+
+audio_buffer_service.set_callback(on_buffer_ready_enqueue)
 
 # Criar servidor Socket.IO
 # Configurações para melhor compatibilidade com Railway e polling HTTP
@@ -170,6 +370,39 @@ except Exception as e:
     )
     transcription_service = None
 logger.info("✅ [SOCKET.IO] Serviços inicializados, Socket.IO server pronto")
+
+# Deep queue consumer initialization moved to main.py startup event.
+# Do NOT call create_task here at module level - exceptions get silently ignored.
+def start_deep_queue_consumer():
+    """
+    Start deep queue consumer. Must be called from FastAPI startup event.
+    """
+    if not _deep_queue_enabled or not _deep_redis_url:
+        logger.info(
+            "⏭️ [DEEP_QUEUE] Deep queue disabled, using direct Socket.IO path",
+            deep_queue_enabled=_deep_queue_enabled,
+            redis_url_configured=bool(_deep_redis_url),
+        )
+        return
+    
+    task = asyncio.create_task(_deep_audio_loop())
+    
+    def on_done(t: asyncio.Task):
+        if t.exception():
+            logger.critical(
+                "💀 [DEEP_QUEUE] Consumer loop terminated with exception",
+                error=str(t.exception()),
+                error_type=type(t.exception()).__name__,
+            )
+        else:
+            logger.warn("⚠️ [DEEP_QUEUE] Consumer loop terminated normally (should run forever)")
+    
+    task.add_done_callback(on_done)
+    
+    logger.info(
+        "✅ [DEEP_QUEUE] Deep audio consumer task scheduled with error tracking",
+        stream=_deep_audio_stream,
+    )
 
 
 @sio.event
@@ -454,7 +687,7 @@ async def audio_chunk(sid, data: Dict[str, Any]):
             )
             return
         
-        # Buffer está pronto imediatamente! Processar via callback
+        # Buffer está pronto imediatamente!
         logger.info(
             "🎙️ [FLUXO] Buffer pronto imediatamente, processando via callback",
             client_id=sid,
@@ -463,15 +696,16 @@ async def audio_chunk(sid, data: Dict[str, Any]):
             audio_size_bytes=len(combined_wav)
         )
         
-        # Processar via callback (que faz transcrição + análise)
-        await on_buffer_ready(
+        # Backpressure: não bloquear o handler aguardando transcrição/análise.
+        # Agendamos o job e coalescemos se chegar mais áudio (sempre processar o mais recente).
+        _schedule_buffer_job(
             meeting_id=meeting_id,
             participant_id=participant_id,
             track=track,
             wav_data=combined_wav,
             sample_rate=sample_rate,
             channels=channels,
-            timestamp=timestamp
+            timestamp=timestamp,
         )
         
         return

@@ -4,6 +4,7 @@ Orquestra análise com BERT, gerencia cache e agrega resultados.
 """
 
 from typing import Dict, Any, Tuple, List
+import re
 from ..types.messages import TranscriptionChunk
 from ..models.bert_analyzer import BERTAnalyzer
 from ..models.conversation_context import ConversationContext
@@ -18,6 +19,8 @@ from ..signals.reformulation import (
 from ..signals.indecision import compute_indecision_metrics_safe
 import structlog
 import time
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 
 logger = structlog.get_logger()
 
@@ -70,6 +73,24 @@ class TextAnalysisService:
         # Coletor de métricas semânticas
         self.metrics = SemanticMetrics(alpha=0.1)
         
+        # FASE 1: ThreadPoolExecutor para carregamento assíncrono de modelos BERT/SBERT
+        # Carregamento de modelos é bloqueante (~60s total), então executamos em thread separada
+        # para não bloquear o event loop do asyncio (permite que Socket.IO aceite conexões)
+        self._executor = ThreadPoolExecutor(max_workers=1)
+        
+        # FASE 1: Flags para evitar carregamento duplicado de modelos
+        # Evita race condition quando múltiplas análises simultâneas tentam carregar modelos
+        self._bert_loading = False
+        self._sbert_loading = False
+        
+        # FASE 1: Lock assíncrono para garantir carregamento único de modelos
+        # Inicializado como None e criado quando necessário (dentro de contexto async)
+        try:
+            self._model_loading_lock = asyncio.Lock()
+        except RuntimeError:
+            # Se não houver event loop no momento da inicialização, criar None e inicializar depois
+            self._model_loading_lock = None
+        
         logger.info(
             "✅ [SERVIÇO] TextAnalysisService inicializado",
             cache_ttl=Config.CACHE_TTL_SECONDS,
@@ -95,6 +116,119 @@ class TextAnalysisService:
                 sbert_model_name=getattr(Config, 'SBERT_MODEL_NAME', None)
             )
         return self.analyzer
+    
+    async def _ensure_models_loaded(self, require_sbert: bool = False):
+        """
+        FASE 2: Garante que modelos BERT/SBERT estão carregados (lazy loading assíncrono).
+        
+        Executa carregamento no executor para não bloquear event loop.
+        Usa lock para evitar carregamento duplicado simultâneo.
+        
+        Args:
+            require_sbert: Se True, também carrega SBERT (necessário para análise semântica)
+        """
+        # Inicializar lock se ainda não foi criado (caso não havia event loop no __init__)
+        if self._model_loading_lock is None:
+            try:
+                self._model_loading_lock = asyncio.Lock()
+            except RuntimeError:
+                # Se ainda não houver event loop, criar um novo
+                # Isso pode acontecer em alguns contextos de teste
+                self._model_loading_lock = asyncio.Lock()
+        
+        # Adquirir lock para evitar carregamento duplicado simultâneo
+        async with self._model_loading_lock:
+            # Garantir que analyzer existe (instanciar se necessário)
+            if self.analyzer is None:
+                self._get_analyzer()
+            
+            # Carregar BERT se necessário
+            if not self.analyzer._loaded:
+                if not self._bert_loading:
+                    self._bert_loading = True
+                    try:
+                        logger.info(
+                            "🔄 [ANÁLISE] Carregando modelo BERT em thread separada (não bloqueia event loop)",
+                            model=Config.MODEL_NAME
+                        )
+                        
+                        # Obter event loop para executar no executor
+                        try:
+                            loop = asyncio.get_running_loop()
+                        except RuntimeError:
+                            loop = asyncio.get_event_loop()
+                        
+                        # Carregar no executor (não bloqueia event loop)
+                        # Isso libera o event loop para processar outros eventos (ex: health_ping, conexões Socket.IO)
+                        await loop.run_in_executor(
+                            self._executor,
+                            self._load_bert_model_sync
+                        )
+                        
+                        logger.info(
+                            "✅ [ANÁLISE] Modelo BERT carregado com sucesso",
+                            model=Config.MODEL_NAME
+                        )
+                    finally:
+                        self._bert_loading = False
+            
+            # Carregar SBERT se necessário
+            if require_sbert and not self.analyzer._sbert_loaded:
+                if not self._sbert_loading:
+                    self._sbert_loading = True
+                    try:
+                        logger.info(
+                            "🔄 [ANÁLISE] Carregando modelo SBERT em thread separada (não bloqueia event loop)",
+                            model=getattr(Config, 'SBERT_MODEL_NAME', None)
+                        )
+                        
+                        # Obter event loop para executar no executor
+                        try:
+                            loop = asyncio.get_running_loop()
+                        except RuntimeError:
+                            loop = asyncio.get_event_loop()
+                        
+                        # Carregar no executor (não bloqueia event loop)
+                        # Isso libera o event loop para processar outros eventos (ex: health_ping, conexões Socket.IO)
+                        await loop.run_in_executor(
+                            self._executor,
+                            self._load_sbert_model_sync
+                        )
+                        
+                        logger.info(
+                            "✅ [ANÁLISE] Modelo SBERT carregado com sucesso",
+                            model=getattr(Config, 'SBERT_MODEL_NAME', None)
+                        )
+                    finally:
+                        self._sbert_loading = False
+    
+    def _load_bert_model_sync(self):
+        """
+        FASE 2: Carrega modelo BERT de forma síncrona (executar no executor).
+        
+        Este método é projetado para ser executado em ThreadPoolExecutor,
+        permitindo que o carregamento bloqueante (~25-35s) não bloqueie o event loop.
+        
+        NOTA: Não deve ser chamado diretamente - use _ensure_models_loaded().
+        """
+        if not self.analyzer:
+            self._get_analyzer()
+        if not self.analyzer._loaded:
+            self.analyzer._load_model()
+    
+    def _load_sbert_model_sync(self):
+        """
+        FASE 2: Carrega modelo SBERT de forma síncrona (executar no executor).
+        
+        Este método é projetado para ser executado em ThreadPoolExecutor,
+        permitindo que o carregamento bloqueante (~25-30s) não bloqueie o event loop.
+        
+        NOTA: Não deve ser chamado diretamente - use _ensure_models_loaded().
+        """
+        if not self.analyzer:
+            self._get_analyzer()
+        if not self.analyzer._sbert_loaded:
+            self.analyzer._load_sbert_model()
     
     def _get_context_key(self, chunk: TranscriptionChunk) -> str:
         """
@@ -180,10 +314,17 @@ class TextAnalysisService:
             word_count=len(chunk.text.split())
         )
         
-        # Obter analisador (lazy loading)
+        # FASE 3: Garantir que modelo BERT está carregado (assíncrono, não bloqueia event loop)
+        # Isso libera o event loop durante carregamento inicial (~25-35s na primeira chamada)
+        # Após carregamento, análises são rápidas (~10-50ms)
+        # O carregamento acontece no executor, permitindo que Socket.IO aceite conexões
+        await self._ensure_models_loaded(require_sbert=False)
+        
+        # Obter analisador (agora garantimos que BERT está carregado)
         analyzer = self._get_analyzer()
         
-        # Executar análises em paralelo (futuro: usar asyncio.gather)
+        # FASE 3: Executar análises (modelos já carregados, chamadas são rápidas)
+        # Todas essas chamadas são síncronas mas rápidas após carregamento inicial
         logger.debug(
             "📊 [ANÁLISE] Executando análise de sentimento",
             meeting_id=chunk.meetingId
@@ -208,11 +349,15 @@ class TextAnalysisService:
         semantic_analysis = None
         try:
             if Config.SBERT_MODEL_NAME:
+                # FASE 3: Garantir que modelo SBERT está carregado antes de usar
+                # Carregamento acontece no executor, não bloqueia event loop
+                await self._ensure_models_loaded(require_sbert=True)
+                
                 logger.debug(
                     "🧠 [ANÁLISE] Executando análise semântica com SBERT",
                     meeting_id=chunk.meetingId
                 )
-                # Realizar análise semântica completa
+                # Realizar análise semântica completa (SBERT já carregado, chamada é rápida ~50ms)
                 # Por enquanto, não passamos textos de referência, mas isso pode ser
                 # implementado no futuro para detectar repetição de ideias
                 semantic_analysis = analyzer.analyze_semantics(chunk.text)
@@ -390,6 +535,9 @@ class TextAnalysisService:
         sales_category_ambiguity = None
         sales_category_intensity = None
         sales_category_flags: Dict[str, bool] = {}
+        sales_category_best_score = 0.0
+        sales_category_scores: Dict[str, float] = {}
+        sales_category_top_3: List[Dict[str, float]] = []
         try:
             if Config.SBERT_MODEL_NAME:
                 logger.debug(
@@ -397,6 +545,11 @@ class TextAnalysisService:
                     meeting_id=chunk.meetingId,
                     text_preview=chunk.text[:50]
                 )
+                
+                # FASE 3: Garantir que modelo SBERT está carregado antes de classificar
+                # classify_sales_category() requer SBERT, então precisamos carregar antes
+                # Carregamento acontece no executor, não bloqueia event loop
+                await self._ensure_models_loaded(require_sbert=True)
                 
                 # Classificar texto em categoria de vendas
                 # O método classify_sales_category() retorna:
@@ -417,6 +570,74 @@ class TextAnalysisService:
                 sales_category_ambiguity = ambiguidade
                 sales_category_intensity = intensidade
                 sales_category_flags = flags
+                sales_category_best_score = max(scores.values()) if scores else 0.0
+                sales_category_scores = scores
+                sales_category_top_3 = [
+                    {"category": cat, "score": round(score, 4)}
+                    for cat, score in sorted(scores.items(), key=lambda x: x[1], reverse=True)[:3]
+                ]
+
+                if sales_category is None:
+                    top_3 = [
+                        (cat, round(score, 4))
+                        for cat, score in sorted(scores.items(), key=lambda x: x[1], reverse=True)[:3]
+                    ]
+                    logger.debug(
+                        "⚠️ [ANÁLISE] Sales category não definida (baixo score)",
+                        meeting_id=chunk.meetingId,
+                        text_preview=chunk.text[:80],
+                        confidence=round(confianca or 0.0, 4),
+                        ambiguity=round(ambiguidade or 0.0, 4),
+                        intensity=round(intensidade or 0.0, 4),
+                        top_3_categories=top_3
+                    )
+
+                    # Fallback: tentar classificação por segmentos quando texto é longo/misto
+                    segments = self._split_for_sales_category(chunk.text)
+                    if len(segments) > 1:
+                        best_segment_score = 0.0
+                        best_segment_result = None
+                        for segment in segments:
+                            seg_cat, seg_conf, seg_scores, seg_amb, seg_int, seg_flags = analyzer.classify_sales_category(
+                                segment,
+                                min_confidence=0.0
+                            )
+                            if not seg_scores:
+                                continue
+                            seg_best_score = max(seg_scores.values())
+                            if seg_best_score > best_segment_score:
+                                best_segment_score = seg_best_score
+                                best_segment_result = (
+                                    seg_cat, seg_conf, seg_scores, seg_amb, seg_int, seg_flags, segment
+                                )
+
+                        if best_segment_result:
+                            seg_cat, seg_conf, seg_scores, seg_amb, seg_int, seg_flags, segment = best_segment_result
+                            is_indecision = seg_cat in ['stalling', 'objection_soft']
+                            if is_indecision and best_segment_score >= 0.15 and (seg_int or 0.0) >= 0.25:
+                                logger.info(
+                                    "✅ [ANÁLISE] Fallback por segmento ativado (indecisão detectada)",
+                                    meeting_id=chunk.meetingId,
+                                    text_preview=chunk.text[:80],
+                                    segment_preview=segment[:80],
+                                    category=seg_cat,
+                                    best_score=round(best_segment_score, 4),
+                                    confidence=round(seg_conf or 0.0, 4),
+                                    ambiguity=round(seg_amb or 0.0, 4),
+                                    intensity=round(seg_int or 0.0, 4)
+                                )
+
+                                sales_category = seg_cat
+                                sales_category_confidence = seg_conf
+                                sales_category_ambiguity = seg_amb
+                                sales_category_intensity = seg_int
+                                sales_category_flags = seg_flags
+                                sales_category_best_score = best_segment_score
+                                sales_category_scores = seg_scores
+                                sales_category_top_3 = [
+                                    {"category": cat, "score": round(score, 4)}
+                                    for cat, score in sorted(seg_scores.items(), key=lambda x: x[1], reverse=True)[:3]
+                                ]
                 
                 if sales_category:
                     # Construir reasoning detalhado para logs explicáveis
@@ -447,7 +668,7 @@ class TextAnalysisService:
                     )
                 else:
                     # Construir reasoning para caso sem categoria detectada
-                    best_score = max(scores.values()) if scores else 0.0
+                    best_score = sales_category_best_score
                     reasoning = {
                         "why": "No category met minimum confidence threshold",
                         "reason": f"Best score {round(best_score, 2)} < {0.15}",
@@ -477,6 +698,9 @@ class TextAnalysisService:
             sales_category_ambiguity = None
             sales_category_intensity = None
             sales_category_flags = {}
+            sales_category_best_score = 0.0
+            sales_category_scores = {}
+            sales_category_top_3 = []
 
         # ========================================================================
         # (Opcional) Reformulação do cliente ("solução foi compreendida")
@@ -670,6 +894,9 @@ class TextAnalysisService:
             'sales_category_intensity': sales_category_intensity,
             'sales_category_ambiguity': sales_category_ambiguity,
             'sales_category_flags': sales_category_flags,
+            'sales_category_best_score': sales_category_best_score,
+            'sales_category_scores': sales_category_scores,
+            'sales_category_top_3': sales_category_top_3,
             # Análises contextuais (baseadas em histórico)
             'sales_category_aggregated': sales_category_aggregated,
             'sales_category_transition': sales_category_transition,
@@ -760,6 +987,17 @@ class TextAnalysisService:
         if has_question:
             return ('ask_question', 0.6)
         return ('statement', 0.5)
+
+    def _split_for_sales_category(self, text: str) -> List[str]:
+        if not text:
+            return []
+        # Dividir por pontuação e novas linhas; manter segmentos mínimos para evitar ruído
+        parts = [p.strip() for p in re.split(r'[.!?;:\n]+', text) if p.strip()]
+        segments = [p for p in parts if len(p.split()) >= 3 and len(p) >= 12]
+        # Limitar para reduzir custo
+        if len(segments) > 6:
+            segments = segments[-6:]
+        return segments
     
     def _detect_topic(self, text: str, keywords: List[str]) -> Tuple[str, float]:
         """

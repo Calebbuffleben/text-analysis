@@ -14,6 +14,7 @@ Serviço Python para análise de transcrições em tempo real.
 - ✅ **Embeddings Semânticos**: Geração de vetores semânticos (384 dimensões)
 - ✅ **Cache Inteligente**: Cache de resultados para otimização de performance
 - ✅ **Transcrição de Áudio**: Integração com Whisper para transcrição em tempo real
+- ✅ **Deep Queue (Redis Streams)**: Processamento escalável via Redis Streams com backpressure e coalescing
 
 ## Docker (Recomendado)
 
@@ -43,6 +44,28 @@ O serviço estará disponível em:
 - **Socket.IO:** `http://localhost:8001/socket.io/`
 
 **Nota:** A porta 8001 no host está mapeada para a porta 8000 no container.
+
+### Deep Queue (Redis Streams)
+
+Quando `DEEP_QUEUE_ENABLED=true`, o serviço Python usa Redis Streams para processamento escalável:
+
+**Fluxo:**
+1. **Consumo de Áudio**: Lê chunks de áudio do Redis Stream (`deep:audio_jobs`)
+   - Usa consumer groups para distribuir carga entre múltiplos workers
+   - Implementa backpressure com coalescing (processa apenas o chunk mais recente por participante/track)
+   - Fail-stop mechanism: encerra após 10 erros consecutivos
+2. **Processamento**: Transcreve e analisa texto usando Whisper + BERT
+3. **Publicação de Resultados**: Publica resultados no Redis Stream (`deep:text_results`)
+   - Backend consome via `DeepResultsConsumerService`
+
+**Benefícios:**
+- **Escalabilidade**: Múltiplos workers podem consumir do mesmo stream
+- **Confiabilidade**: Redis Streams fornecem persistência e tracking de mensagens processadas
+- **Backpressure**: Coalescing previne sobrecarga do sistema
+- **Desacoplamento**: Áudio ingestion e processamento são independentes
+
+**Inicialização:**
+O consumer do Redis Stream é iniciado automaticamente no FastAPI startup event quando `DEEP_QUEUE_ENABLED=true`.
 
 ### Usando Docker diretamente
 
@@ -78,8 +101,16 @@ PORT=8000
 HOST=0.0.0.0
 LOG_LEVEL=INFO
 
-# Socket.IO
+# Socket.IO (usado quando DEEP_QUEUE_ENABLED=false)
 SOCKETIO_CORS_ORIGINS=*
+
+# Deep Queue (Redis Streams) - usado quando DEEP_QUEUE_ENABLED=true
+DEEP_QUEUE_ENABLED=true
+DEEP_REDIS_URL=redis://default:password@redis-host:6379
+DEEP_AUDIO_STREAM_KEY=deep:audio_jobs
+DEEP_RESULTS_STREAM_KEY=deep:text_results
+DEEP_CONSUMER_GROUP=deep_audio_workers
+DEEP_CONSUMER_NAME=worker-1
 
 # ML Models
 MODEL_CACHE_DIR=/app/models/.cache
@@ -307,6 +338,46 @@ Para habilitar a classificação de categorias de vendas, configure:
 SBERT_MODEL_NAME=sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
 ```
 
+### IMPORTANT: intensity vs confidence
+
+**intensity** is used for signal collection (semantic strength):
+- Represents absolute match strength of the best category (0.0-1.0)
+- Use intensity for initial filtering/threshold checking
+- Generally higher than confidence when categories are close
+- Example: intensity = 0.35 means 35% semantic match with best category
+
+**confidence** is used only for final validation (class separation):
+- Represents relative difference between best and second-best category (0.0-1.0)
+- Use confidence only for average confidence validation
+- Can be very low (e.g., 0.007) even when intensity is valid
+- Example: confidence = 0.007 means categories are very close (low separation)
+
+**Do NOT use confidence for initial filtering** - it can be very low even when the semantic match is valid. Always use intensity for collection thresholds.
+
+## Arquitetura de Comunicação
+
+O serviço Python suporta dois modos de comunicação com o backend:
+
+### Modo Direto (Socket.IO) - `DEEP_QUEUE_ENABLED=false`
+
+- Comunicação bidirecional via Socket.IO
+- Áudio enviado diretamente via eventos `audio_chunk`
+- Resultados retornados via eventos `text_analysis_result`
+- Útil para desenvolvimento e ambientes pequenos
+
+### Modo Deep Queue (Redis Streams) - `DEEP_QUEUE_ENABLED=true`
+
+- **Áudio**: Consumido de Redis Stream (`deep:audio_jobs`)
+  - Consumer group: `deep_audio_workers`
+  - Backpressure com coalescing (apenas chunk mais recente por chave)
+  - Iniciado automaticamente no FastAPI startup event
+- **Resultados**: Publicados em Redis Stream (`deep:text_results`)
+  - Backend consome via `DeepResultsConsumerService`
+- **Escalabilidade**: Permite múltiplos workers processando em paralelo
+- **Confiabilidade**: Redis Streams fornece persistência e tracking
+
+**Nota**: Quando `DEEP_QUEUE_ENABLED=true`, o serviço Python **não** aceita conexões Socket.IO do backend para áudio. O Socket.IO é usado apenas para resultados quando a queue está desabilitada.
+
 ### Uso
 
 A classificação é automática quando o serviço recebe transcrições. O resultado inclui:
@@ -315,7 +386,8 @@ A classificação é automática quando o serviço recebe transcrições. O resu
 {
   "analysis": {
     "sales_category": "price_interest",
-    "sales_category_confidence": 0.85,
+    "sales_category_intensity": 0.35,
+    "sales_category_confidence": 0.007,
     ...
   }
 }
