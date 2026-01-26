@@ -26,6 +26,7 @@ services:
       - ENABLE_ML_ANALYSIS=true
       - ANALYSIS_BATCH_SIZE=1
       - ANALYSIS_MAX_LENGTH=512
+      - RMS_SPEECH_THRESHOLD_DB=-50
     volumes:
       - ./src:/app/src:ro
       - text_analysis_models:/app/models
