@@ -48,6 +48,12 @@ class Config:
     WHISPER_LANGUAGE: str = os.getenv('WHISPER_LANGUAGE', 'pt')
     WHISPER_TASK: str = os.getenv('WHISPER_TASK', 'transcribe')
     
+    # Transcription Concurrency Configuration
+    # Number of concurrent transcriptions allowed (default: 2)
+    # Higher values allow processing multiple participants in parallel
+    # but consume more CPU/memory
+    MAX_CONCURRENT_TRANSCRIPTIONS: int = int(os.getenv('MAX_CONCURRENT_TRANSCRIPTIONS', '2'))
+    
     @classmethod
     def validate(cls):
         """Valida configurações críticas"""

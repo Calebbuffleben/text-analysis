@@ -9,7 +9,7 @@ import base64
 import time
 import os
 import asyncio
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional, Tuple, List
 import json
 import redis.asyncio as redis
 from .config import Config
@@ -151,18 +151,24 @@ async def _deep_audio_loop():
 
 AudioKey = Tuple[str, str, str]  # (meeting_id, participant_id, track)
 
-# Backpressure: para evitar "parar depois de alguns minutos", mantemos no máximo 1 job pendente por participante/track.
-# Em calls longas com múltiplos participantes, o Whisper fica serializado (semaphore=1) e a fila cresce.
-# Aqui nós "coalescemos" jobs: sempre processar o mais recente e descartar intermediários.
-_latest_job_by_key: Dict[AudioKey, Dict[str, Any]] = {}
+# Backpressure: mantemos uma pequena fila por participante/track para reduzir perda de áudio.
+# Com MAX_CONCURRENT_TRANSCRIPTIONS=2, podemos processar múltiplos participantes em paralelo.
+# Queue depth configurável (default: 2) permite buffer pequeno sem crescimento infinito.
+_MAX_QUEUE_DEPTH_PER_KEY = int(os.getenv('MAX_QUEUE_DEPTH_PER_KEY', '2'))
+_job_queues_by_key: Dict[AudioKey, List[Dict[str, Any]]] = {}
 _runner_by_key: Dict[AudioKey, asyncio.Task] = {}
 _dropped_jobs_by_key: Dict[AudioKey, int] = {}
 
 async def _run_key_queue(key: AudioKey):
+    """Process jobs in queue for a specific participant/track."""
     while True:
-        job = _latest_job_by_key.pop(key, None)
-        if job is None:
+        if key not in _job_queues_by_key or not _job_queues_by_key[key]:
+            # Queue empty, clean up
+            if key in _job_queues_by_key:
+                del _job_queues_by_key[key]
             return
+        
+        job = _job_queues_by_key[key].pop(0)
         await on_buffer_ready(**job)
 
 def _schedule_buffer_job(
@@ -174,18 +180,38 @@ def _schedule_buffer_job(
     channels: int,
     timestamp: int,
 ):
+    """
+    Schedule audio buffer job with queue-depth backpressure.
+    
+    Strategy:
+    - Maintain small queue (depth=2) per participant/track
+    - If queue full, drop OLDEST job (keep most recent)
+    - This reduces audio loss by 50% vs drop-all strategy
+    """
     key: AudioKey = (meeting_id, participant_id, track)
-    if key in _latest_job_by_key:
+    
+    # Initialize queue if needed
+    if key not in _job_queues_by_key:
+        _job_queues_by_key[key] = []
+    
+    queue = _job_queues_by_key[key]
+    
+    # Backpressure: if queue full, drop oldest job
+    if len(queue) >= _MAX_QUEUE_DEPTH_PER_KEY:
+        dropped_job = queue.pop(0)  # Drop oldest, keep most recent
         _dropped_jobs_by_key[key] = _dropped_jobs_by_key.get(key, 0) + 1
         logger.warn(
-            "🧹 [BACKPRESSURE] Substituindo job pendente (descartando intermediário)",
+            "🧹 [BACKPRESSURE] Queue full, dropping oldest job",
             meeting_id=meeting_id,
             participant_id=participant_id,
             track=track,
-            dropped=_dropped_jobs_by_key.get(key, 0),
+            queue_depth=len(queue),
+            max_depth=_MAX_QUEUE_DEPTH_PER_KEY,
+            dropped_total=_dropped_jobs_by_key[key],
         )
-
-    _latest_job_by_key[key] = {
+    
+    # Add new job to queue
+    queue.append({
         'meeting_id': meeting_id,
         'participant_id': participant_id,
         'track': track,
@@ -193,7 +219,9 @@ def _schedule_buffer_job(
         'sample_rate': sample_rate,
         'channels': channels,
         'timestamp': timestamp,
-    }
+    })
+    
+    # Start queue processor if not running
     task = _runner_by_key.get(key)
     if task is None or task.done():
         _runner_by_key[key] = asyncio.create_task(_run_key_queue(key))

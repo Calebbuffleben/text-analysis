@@ -26,7 +26,9 @@ services:
       - ENABLE_ML_ANALYSIS=true
       - ANALYSIS_BATCH_SIZE=1
       - ANALYSIS_MAX_LENGTH=512
-      - RMS_SPEECH_THRESHOLD_DB=-50
+      - RMS_SPEECH_THRESHOLD_DB=-60
+      - MAX_CONCURRENT_TRANSCRIPTIONS=2
+      - MAX_QUEUE_DEPTH_PER_KEY=2
     volumes:
       - ./src:/app/src:ro
       - text_analysis_models:/app/models

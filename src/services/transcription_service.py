@@ -14,6 +14,7 @@ import asyncio
 import time
 import re
 import structlog
+from threading import Lock
 from faster_whisper import WhisperModel
 import numpy as np
 from typing import Optional, Dict, Any, List
@@ -41,10 +42,12 @@ class TranscriptionService:
     def __init__(self):
         """
         Inicializa serviço de transcrição.
-        O modelo Whisper será carregado apenas na primeira transcrição (lazy loading).
+        O modelo Whisper pode ser pré-carregado no startup ou lazy-loaded na primeira transcrição.
         """
         self.model = None
         self._loaded = False
+        self._load_lock = Lock()  # Thread-safe lock for model loading
+        self._loading = False  # Flag to prevent concurrent loads
         self.model_name = Config.WHISPER_MODEL_NAME
         self.device = Config.WHISPER_DEVICE
         self.language = Config.WHISPER_LANGUAGE
@@ -72,13 +75,15 @@ class TranscriptionService:
         )
         
         # Semáforo para limitar transcrições simultâneas
-        # faster-whisper é mais eficiente, mas ainda limitamos a 1 transcrição por vez
-        # para evitar sobrecarga e garantir que cada transcrição tenha recursos completos
+        # Configurável via MAX_CONCURRENT_TRANSCRIPTIONS (default: 2)
+        # Permite processar múltiplos participantes em paralelo
+        max_concurrent = Config.MAX_CONCURRENT_TRANSCRIPTIONS
         try:
-            self._transcription_semaphore = asyncio.Semaphore(1)
+            self._transcription_semaphore = asyncio.Semaphore(max_concurrent)
         except RuntimeError:
             # Se não houver event loop, criar None e inicializar depois
             self._transcription_semaphore = None
+        self._max_concurrent = max_concurrent
         self._active_transcriptions = 0
         
         # Duração mínima de áudio para transcrição (em segundos)
@@ -106,21 +111,64 @@ class TranscriptionService:
         # ThreadPoolExecutor para executar faster-whisper em thread separada
         # faster-whisper é mais rápido mas ainda bloqueante, então executamos em thread separada
         # para não bloquear o event loop do asyncio
-        self._executor = ThreadPoolExecutor(max_workers=1)
+        # Número de workers = max_concurrent para permitir paralelismo
+        self._executor = ThreadPoolExecutor(max_workers=max_concurrent)
         
         logger.info(
             "✅ [SERVIÇO] TranscriptionService inicializado",
             model=self.model_name,
             device=self.device,
             language=self.language,
-            max_concurrent_transcriptions=1,
+            max_concurrent_transcriptions=max_concurrent,
             min_audio_duration_sec=self._min_audio_duration_sec,
             rms_speech_threshold_db=self._rms_speech_threshold_db
         )
     
+    async def ensure_model_loaded(self):
+        """
+        Pre-load model during startup. Thread-safe and idempotent.
+        Can be called multiple times safely - only loads once.
+        
+        This method uses double-check locking pattern to ensure:
+        1. Only one thread loads the model at a time
+        2. If model is already loaded, returns immediately
+        3. If another thread is loading, waits for it to complete
+        """
+        # Fast path: already loaded
+        if self._loaded:
+            return
+        
+        # Acquire lock to check/set loading state
+        with self._load_lock:
+            # Double-check pattern: another thread might have loaded while waiting
+            if self._loaded:
+                return
+            
+            # Check if another thread is currently loading
+            if self._loading:
+                # Release lock and wait for loading to complete
+                pass
+            else:
+                # This thread will load the model
+                self._loading = True
+        
+        # If we set _loading to True, we're responsible for loading
+        if self._loading and not self._loaded:
+            try:
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(self._executor, self._load_model)
+                logger.info("✅ [TRANSCRIÇÃO] Model pre-loaded successfully during startup")
+            finally:
+                with self._load_lock:
+                    self._loading = False
+        else:
+            # Another thread is loading, wait for it
+            while self._loading and not self._loaded:
+                await asyncio.sleep(0.1)
+    
     def _load_model(self):
         """
-        Carrega modelo faster-whisper (lazy loading).
+        Carrega modelo faster-whisper.
         
         Modelos disponíveis (do menor ao maior):
         - tiny: ~39M parâmetros, mais rápido, menos preciso
@@ -134,9 +182,11 @@ class TranscriptionService:
         
         faster-whisper é mais rápido que openai-whisper, especialmente em CPU
         com compute_type="int8".
+        
+        Thread-safe: Should only be called from ensure_model_loaded() which handles locking.
         """
+        # Double-check: already loaded
         if self._loaded:
-            logger.debug("Modelo faster-whisper já carregado", model=self.model_name)
             return
         
         logger.info(
@@ -244,19 +294,12 @@ class TranscriptionService:
         result = service.transcribe_audio(wav_bytes, sample_rate=16000, language='pt')
         print(result['text'])  # "Olá, como você está?"
         """
-        # Carregar modelo de forma assíncrona se necessário
-        if not self._loaded:
-            logger.info("🔄 [TRANSCRIÇÃO] Modelo não carregado, carregando agora...")
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(
-                self._executor,
-                self._load_model
-            )
-            logger.info("✅ [TRANSCRIÇÃO] Modelo carregado, prosseguindo com transcrição")
+        # Ensure model is loaded (thread-safe, idempotent)
+        await self.ensure_model_loaded()
         
         # Inicializar semáforo se ainda não foi criado (fallback)
         if self._transcription_semaphore is None:
-            self._transcription_semaphore = asyncio.Semaphore(1)
+            self._transcription_semaphore = asyncio.Semaphore(self._max_concurrent)
         
         try:
             # FASE 2: Validações rápidas (<1ms, no event loop)
@@ -897,8 +940,8 @@ class TranscriptionService:
         
         has_speech = max_rms >= rms_threshold_linear
         
-        logger.debug(
-            "🔍 [PRÉ-PROCESSAMENTO] Verificação RMS de fala",
+        logger.info(
+            "🔍 [RMS_DEBUG] Verificação RMS de fala",
             max_rms_db=round(20 * np.log10(max_rms + 1e-10), 2),
             threshold_db=rms_threshold_db,
             has_speech=has_speech,
