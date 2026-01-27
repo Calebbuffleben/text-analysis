@@ -122,12 +122,21 @@ EMOTION_MODEL=cardiffnlp/twitter-roberta-base-emotion
 # SBERT para classificação de categorias de vendas (opcional mas recomendado)
 SBERT_MODEL_NAME=sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
 
+# Whisper Transcription
+WHISPER_MODEL_NAME=medium
+WHISPER_DEVICE=cpu
+WHISPER_LANGUAGE=pt
+
+# Audio Preprocessing
+# Threshold RMS para detecção de fala (em dB, valores mais negativos = mais permissivo)
+# Padrão: -50 (permissivo para Google Meet/ambientes de teste)
+# Use -40 para ambientes controlados, -60 para ambientes muito ruidosos
+RMS_SPEECH_THRESHOLD_DB=-50
+
 # Performance
 ANALYSIS_BATCH_SIZE=1
 ANALYSIS_MAX_LENGTH=512
 ```
-<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>
-read_file
 
 ### Verificar se Está Funcionando
 

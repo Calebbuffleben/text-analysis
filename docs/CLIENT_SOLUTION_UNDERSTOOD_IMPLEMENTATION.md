@@ -13,14 +13,14 @@
 - [ ] **Passo 0 — Confirmar o pipeline e dados disponíveis** (payload já tem `analysis.embedding`, keywords, speech_act).
 - [ ] **Passo 1 — Definir o sinal e falsos positivos** (o que é “reformulação” vs “ok entendi”).
 - [ ] **Passo 2 — Escolher base semântica e thresholds iniciais** (cosine similarity + ranges).
-- [ ] **Passo 3 — Criar estado/memória curta no backend** (contexto de solução do host).
-- [ ] **Passo 4 — Detectar “explicação de solução” do host** (context builder + strength).
+- [x] **Passo 3 — Reutilizar textHistory existente** (sem estado adicional).
+- [x] **Passo 4 — Armazenamento Automático** (sem filtro especial).
 - [ ] **Passo 5 — Detectar marcadores de reformulação do cliente** (regex/substring + “conteúdo suficiente”).
-- [ ] **Passo 6 — Calcular similaridade e confidence combinado** (pesos + threshold).
+- [x] **Passo 6 — Calcular similaridade e confidence combinado** (pesos atualizados).
 - [ ] **Passo 7 — Gating + cooldown + antispam** (mesmo padrão do indecision).
 - [ ] **Passo 8 — Definir payload/UX do feedback** (`severity`, message, tips, metadata).
-- [ ] **Passo 9 — Implementar no backend (arquivos e integração)** (`handleTextAnalysis` + delivery).
-- [ ] **Passo 10 (Opcional) — Melhorias no Python** (flags/métricas, se quiser).
+- [x] **Passo 9 — Implementação no backend** (simplificada com textHistory).
+- [x] **Passo 10 — Python Service** (sem mudanças necessárias).
 - [ ] **Passo 11 — Testes e validação** (unit + golden dataset).
 - [ ] **Passo 12 — Rollout e segurança** (feature flag, env vars, privacidade).
 - [ ] **Passo 13 — Riscos e mitigação** (FPs, contexto errado, transcrição ruidosa).
@@ -28,16 +28,59 @@
 
 ---
 
+## Arquitetura Atual (Implementada)
+
+### Fluxo Simplificado
+
+```mermaid
+graph LR
+    A[Python: Transcribe + Analyze] --> B[Envia embedding + keywords]
+    B --> C[Backend: Armazena em textHistory]
+    C --> D[Cliente reformula]
+    D --> E[Backend: Busca textHistory do host]
+    E --> F[Compara embeddings]
+    F --> G{Similaridade + Marcadores?}
+    G -->|Sim| H[Dispara Feedback]
+    G -->|Não| I[Ignora]
+```
+
+### Responsabilidades
+
+**Python Service:**
+- Transcrição (Whisper)
+- Análise de texto (BERT/SBERT)
+- Extração de embeddings e keywords
+- Envio via Socket.IO ou Redis
+
+**Backend Node.js:**
+- Recebe text_analysis_result
+- Armazena automaticamente em textHistory
+- Detecta reformulação comparando textHistory cliente vs host
+- Dispara feedback
+
+### Estado e Persistência
+
+- ✅ `textHistory`: Mantido em memória por participante (últimos 20 chunks)
+- ❌ Sem `solutionContextByMeeting` ou estado adicional
+- ✅ Compatível com múltiplas instâncias backend
+- ✅ Compatível com Redis architecture
+
+---
+
 ## Passo 0 — Confirmar o pipeline e dados disponíveis
 
-- **Backend (Nest)** recebe eventos `text_analysis_result` via `TextAnalysisService` (`apps/backend/src/pipeline/text-analysis.service.ts`).
-- O evento já contém:
+- **Python Service** realiza transcrição (Whisper) e análise (BERT/SBERT)
+- Envia via Socket.IO ou Redis: `text_analysis_result` com:
   - `analysis.embedding: number[]` (SBERT, dimensão 384)
-  - `analysis.keywords`, `analysis.speech_act`, `analysis.intent`, `analysis.sales_category_*` etc.
-- O `FeedbackAggregatorService` (`apps/backend/src/feedback/feedback.aggregator.service.ts`) mantém estado por participante e dispara heurísticas (como `sales_client_indecision`).
-- O `FeedbackDeliveryService` publica para os hosts via Socket.IO (room `feedback:${meetingId}`), exibido no overlay (`apps/chrome-extension/feedback-overlay.js`).
+  - `analysis.keywords: string[]`
+  - `analysis.speech_act`, `analysis.intent`, etc.
+  - `analysis.reformulation_markers_detected` (opcional)
 
-**Implicação importante**: dá para implementar “solução foi compreendida” **sem mudanças no serviço Python** no MVP, porque a semântica necessária (embedding + keywords + speech_act) já existe no payload.
+- **Backend (Nest)** recebe via `TextAnalysisService`
+- Armazena automaticamente em `textHistory` (últimos 20 chunks por participante)
+- `FeedbackAggregatorService` detecta reformulação comparando textHistory do cliente com textHistory do host
+
+**Importante:** A implementação atual NÃO requer mudanças no serviço Python, apenas no backend.
 
 ---
 
@@ -74,61 +117,56 @@ Onde:
 
 ---
 
-## Passo 3 — Estado (memória curta) necessária no backend
+## Passo 3 — Reutilizar textHistory existente
 
-### 1) Identificar “quem é cliente” vs “host”
+### Arquitetura Simplificada
 
-O feedback é para o vendedor/hosts, mas o sinal vem do cliente. Reusar a mesma regra já usada no fluxo de “sales_*”.
+- **Sem estado adicional**: Backend reutiliza `textHistory` já mantido em `ParticipantState`
+- `textHistory` armazena automaticamente:
+  - Últimos 20 chunks de texto por participante
+  - Inclui: `text`, `timestamp`, `embedding`, `keywords`, `sales_category`, etc.
 
-Recomendação:
-- manter/usar método existente do `FeedbackAggregatorService`/`ParticipantIndexService` para determinar se um `participantId` é host.
+### Como funciona
 
-### 2) Guardar contexto de “explicação de solução” do host
+Ao detectar reformulação, backend:
+1. Busca todos os participantes do meeting
+2. Filtra hosts (`role='host'`)
+3. Extrai textHistory recente (últimos 60-90s)
+4. Compara embeddings do cliente com centroid do textHistory do host
 
-Crie uma estrutura de contexto por meeting (ou por host), com janela curta (ex.: últimos 90s):
+### Vantagens
 
-- **`SolutionContextEntry`**:
-  - `ts`
-  - `text`
-  - `embedding` (384 floats)
-  - `keywords` (do Python)
-  - `strength` (heurística: quão “explicação de solução” isso parece)
-
-Política de retenção:
-- manter últimos N (ex.: 12 entradas) e/ou últimos 90s.
-
-### 3) Guardar candidatos do cliente
-
-Não precisa persistir tudo; basta o turno atual (embedding + texto). O histórico só é útil para:
-- consistência temporal
-- evitar duplicação (cooldown)
+- ✅ Sem código adicional para manter contexto
+- ✅ Sem `SolutionContextEntry` ou Map adicional
+- ✅ Compatível com múltiplas instâncias backend
+- ✅ Compatível com Redis architecture
+- ✅ ~150 linhas de código removidas vs arquitetura anterior
 
 ---
 
-## Passo 4 — Heurística: como detectar “explicação de solução” do host (contexto)
+## Passo 4 — Armazenamento Automático (Todos os Participantes)
 
-O maior risco arquitetural aqui é comparar reformulação do cliente com um “contexto errado”.
+### Simplicidade da Nova Arquitetura
 
-No MVP, usar heurística leve (explicável) para construir o contexto \(v\):
+- **Sem filtro especial**: Todo texto analisado é armazenado no `textHistory`
+- **Sem cálculo de "strength"**: Não há heurística para detectar se um turno do host é "explicação"
+- **Backend usa TODOS os chunks recentes do host** para comparação
+- **Validação acontece na detecção**: Similaridade semântica + marcadores de reformulação garantem precisão
 
-### Sinais para marcar um turno do host como “solution explanation”
+### Vantagens
 
-- **Comprimento**: texto com pelo menos X caracteres (ex.: 80+) ou X tokens estimados.
-- **Padrões linguísticos**:
-  - “funciona assim…”
-  - “na prática…”
-  - “o fluxo é…”
-  - “a gente faz…”
-  - “você vai conseguir…”
-  - “a solução resolve…”
-- **Sales category compatível** (se disponível):
-  - `value_exploration`, `information_gathering`, `price_interest` (depende do seu taxonomy atual)
-  - evitar categorias de cliente (stalling/objection_soft) e ruído
-- **Keywords de produto/ação**: interseção com um pequeno dicionário “solution-ish”
+- ✅ Menos código, menos estados, mais robusto
+- ✅ Não precisa manter lógica de "o que é explicação"
+- ✅ Validação semântica (embedding similarity) é mais precisa que heurísticas de texto
+- ✅ Funciona para qualquer tipo de solução/produto (não depende de palavras-chave fixas)
 
-Defina um `strength` em [0,1] combinando esses sinais, e só inclua no contexto quando `strength >= 0.6`.
+### Mitigação de Falsos Positivos
 
-**Por que isso é suficiente no MVP**: o disparo final ainda exige alta similaridade semântica + marcadores explícitos de reformulação do cliente.
+O risco de "contexto errado" é mitigado por:
+1. **Janela temporal curta** (60-90s): apenas chunks recentes
+2. **Similaridade semântica alta** (>= 0.6): embedding do cliente deve ser similar ao do host
+3. **Keyword overlap**: valida que cliente usa termos relacionados
+4. **Marcadores obrigatórios**: cliente deve usar frases de reformulação explícitas
 
 ---
 
@@ -163,11 +201,11 @@ Regras simples:
 
 ---
 
-## Passo 6 — Cálculo de similaridade e confidence (MVP)
+## Passo 6 — Cálculo de similaridade e confidence (Implementação Atual)
 
 ### 1) Construção do vetor de contexto do host
 
-Selecione entradas no intervalo [now - 90s, now] com `strength >= 0.6`.  
+Busca textHistory do host no intervalo [now - 90s, now].  
 Compute o centroide:
 
 \[
@@ -187,28 +225,34 @@ Valores típicos com SBERT:
 - 0.60–0.70: possivelmente relacionado (depende de ruído)
 - > 0.72: fortemente relacionado (bom threshold inicial)
 
-### 3) Confidence combinado
+### 3) Confidence combinado (Nova Fórmula)
 
-Proposta (explicável e ajustável):
+Componentes:
 
 - `similarityScore` = clamp((s - 0.55) / 0.25, 0, 1)
-- `markerScore` = conforme marcadores
-- `contextStrength` = média dos `strength` do contexto usado
-- `keywordOverlapScore` = min(1, overlap / 3) (overlap = |KW_client ∩ KW_context|)
+- `markerScore` = clamp(markers.length / 2, 0, 1)
+- `keywordOverlapScore` = clamp(overlap / 3, 0, 1) onde overlap = |KW_client ∩ KW_host|
 - `speechActScore`:
   - 1.0 se `speech_act` ∈ {`agreement`, `confirmation`}
   - 0.5 se `ask_info` (pode ser confirmação)
   - 0.0 caso contrário
 
-Confidence final:
-- 45% similarity
-- 20% marker
-- 15% keyword overlap
-- 15% context strength
-- 5% speech act
+**Confidence final (pesos atualizados):**
 
-Threshold inicial recomendado:
-- `SALES_SOLUTION_UNDERSTOOD_THRESHOLD=0.70`
+```typescript
+confidence =
+  similarityScore * 0.50 +      // ↑ Aumentado de 0.45
+  markerScore * 0.25 +          // ↑ Aumentado de 0.20
+  keywordOverlapScore * 0.15 +  // = Mantido
+  speechActScore * 0.10         // ↑ Aumentado de 0.05
+```
+
+**Mudanças vs arquitetura anterior:**
+- ❌ **Removido:** `contextStrength` (15%) - não há mais cálculo de strength
+- ✅ **Redistribuído:** pesos aumentados em similarity, markers e speechAct
+
+**Threshold inicial:**
+- `SALES_SOLUTION_UNDERSTOOD_THRESHOLD=0.70` (padrão)
 
 ---
 
@@ -266,51 +310,118 @@ Salvar no `metadata`:
 
 ---
 
-## Passo 9 — Mudanças no backend (arquivos e pontos de integração)
+## Passo 9 — Implementação no Backend (Arquitetura Simplificada)
 
-### 1) `apps/backend/src/feedback/feedback.aggregator.service.ts`
+### Detector: `detect-solution-understood.ts`
 
-- **Novo detector**:
-  - `detectClientSolutionUnderstood(state, evt, now): FeedbackEventPayload | null`
-- **Novo estado em memória**:
-  - `state.textAnalysis.solutionContext` (ou estrutura por meeting) para guardar `SolutionContextEntry[]`
-- **Funções auxiliares**:
-  - `isHost(participantId)` (reuso)
-  - `isSolutionExplanationHostTurn(evt)` → strength
-  - `detectReformulationMarkers(text)` → markers + score
-  - `cosineSimilarity(a,b)` e `meanEmbedding(list)`
-  - `keywordOverlap(clientKeywords, contextKeywords)`
+**Localização:** `apps/backend/src/feedback/a2e2/text-analysis/detect-solution-understood.ts`
 
-Integração:
-- em `handleTextAnalysis(evt)` depois de atualizar o estado:
-  - atualizar contexto se for host + explanation strength
-  - rodar detector se for cliente
-  - se `feedback != null` → `this.delivery.publishToHosts(...)`
+**Método principal:** `getHostTextHistoryForComparison()`
 
-### 2) `apps/backend/src/feedback/feedback.types.ts`
+```typescript
+private getHostTextHistoryForComparison(
+  meetingId: string,
+  currentParticipantId: string,
+  now: number,
+  ctx: DetectionContext,
+): Array<{ participantId: string; text: string; embedding: number[]; keywords: string[]; ts: number }> {
+  // 1. Buscar todos os participantes do meeting via ctx.getParticipantsForMeeting()
+  // 2. Filtrar apenas hosts (role='host')
+  // 3. Extrair textHistory recente (últimos 60-90s)
+  // 4. Filtrar entries com embedding válido
+  // 5. Retornar entries com embedding e keywords
+}
+```
 
-- adicionar o novo `type` no union/enum do payload.
+**Método de detecção:** `detectClientSolutionUnderstood(state, evt, now, ctx)`
 
-### 3) Prisma / persistência (se salvar no DB)
+Fluxo:
+1. Verifica se não é host (role !== 'host')
+2. Verifica cooldown
+3. Detecta marcadores de reformulação (obrigatório)
+4. Verifica comprimento mínimo (>= 40 chars)
+5. Busca textHistory dos hosts via `getHostTextHistoryForComparison()`
+6. Calcula centroide dos embeddings
+7. Calcula similaridade (cliente vs centroide)
+8. Valida keyword overlap
+9. Calcula confidence combinado
+10. Dispara feedback se confidence >= threshold
 
-- `apps/backend/prisma/schema.prisma`: adicionar valor no enum `FeedbackType`
-- criar migração com `ALTER TYPE "FeedbackType" ADD VALUE ...`
+**Funções auxiliares reutilizadas:**
+- `detectReformulationMarkers(text)` → markers
+- `cosineSimilarity(a,b)` e `meanEmbedding(list)`
+- `keywordOverlapCount(clientKeywords, contextKeywords)`
+- `collectKeywordsFromEntries(entries)` → keywords únicos
+
+### Vantagens da Nova Arquitetura
+
+- ✅ **Sem estado adicional:** Não há `solutionContextByMeeting` Map
+- ✅ **Sem métodos removidos:**
+  - ❌ `updateSolutionContextFromTurn()` - removido
+  - ❌ `computeSolutionExplanationStrength()` - removido
+  - ❌ `getSolutionContextEntriesForDetection()` - removido
+- ✅ **Compatível com múltiplas instâncias:** Cada instância mantém seu textHistory
+- ✅ **Compatível com Redis:** Não depende de estado efêmero
+- ✅ **~150 linhas de código removidas**
+
+### Integração com Pipeline A2E2
+
+O detector é executado automaticamente pelo pipeline A2E2:
+
+```typescript
+// apps/backend/src/feedback/a2e2/pipeline/run-text-analysis-pipeline.ts
+import { DetectSolutionUnderstood } from '../text-analysis/detect-solution-understood';
+
+// Detector é registrado e executado automaticamente
+const detector = new DetectSolutionUnderstood();
+const feedback = detector.run(state, ctx);
+```
+
+### Tipos e Persistência
+
+**Arquivo:** `apps/backend/src/feedback/feedback.types.ts`
+- Tipo: `'sales_solution_understood'`
+- Severidade: `'info'`
+
+**Prisma Schema:** `apps/backend/prisma/schema.prisma`
+- Enum `FeedbackType` já inclui `sales_solution_understood`
 
 ---
 
-## Passo 10 (Opcional) — Mudanças no serviço Python (“fase 2”)
+## Passo 10 — Python Service (Sem Mudanças Necessárias)
 
-O MVP não precisa, mas para melhorar precisão e reduzir heurísticas no backend:
+### Estado Atual: Completo ✅
 
-- adicionar flag em `sales_category_flags`:
-  - `solution_reformulation_signal?: boolean`
-- adicionar métricas:
-  - `reformulation_marker_score`
-  - `reformulation_similarity_hint` (se o Python mantiver contexto — geralmente não vale a pena; melhor manter no backend)
+O serviço Python **já fornece todos os dados necessários** para a detecção funcionar:
 
-**Recomendação**: manter contexto no backend é melhor porque:
-- o backend já gerencia “meeting state” e cooldowns
-- evita acoplar estado no serviço Python (escalabilidade e reinícios)
+- ✅ `embedding` (SBERT, 384 dimensões) - enviado em todos os resultados
+- ✅ `keywords` (extraídos via BERT) - enviados em todos os resultados
+- ✅ `reformulation_markers_detected` (marcadores opcionais) - já implementado
+- ✅ `speech_act`, `sentiment`, `intent` - enviados em todos os resultados
+
+**Nenhuma mudança é necessária** no Python para a arquitetura atual funcionar.
+
+### Por Que Python Não Precisa de Mudanças?
+
+1. **Backend gerencia contexto:** O backend mantém `textHistory` e compara embeddings
+2. **Backend gerencia estado:** Meeting state, cooldowns, roles
+3. **Python é stateless:** Não mantém histórico ou contexto entre chamadas
+4. **Simplicidade:** Separação clara de responsabilidades
+
+### Melhorias Futuras (Opcionais)
+
+Se houver necessidade de melhorar a precisão no futuro:
+
+- **Marcadores adicionais:** Expandir lista de frases de reformulação
+- **Modelo de paráfrase dedicado:** Usar modelo específico para detectar paráfrases
+- **Métricas de teach-back:** Calcular scores de reformulação mais sofisticados
+- **Análise contextual:** Comparar com histórico próprio do Python (não recomendado para MVP)
+
+**Recomendação:** Manter contexto no backend é a melhor abordagem porque:
+- Backend já gerencia meeting state e cooldowns
+- Evita acoplamento de estado no Python
+- Facilita escalabilidade horizontal do Python
+- Permite reiniciar Python sem perder contexto
 
 ---
 

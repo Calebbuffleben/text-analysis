@@ -88,6 +88,21 @@ class TranscriptionService:
         # 3. Melhora qualidade da transcrição
         self._min_audio_duration_sec = 0.5
         
+        # Threshold RMS para detecção de fala (configurável via env)
+        # Valores mais negativos = mais permissivo (detecta áudio mais baixo)
+        # Valores mais altos = mais restritivo (requer áudio mais alto)
+        # Padrão: -50dB (permissivo para ambientes de teste/Google Meet)
+        rms_threshold_env = os.getenv('RMS_SPEECH_THRESHOLD_DB', '-50')
+        try:
+            self._rms_speech_threshold_db = float(rms_threshold_env)
+        except ValueError:
+            logger.warn(
+                "⚠️ [TRANSCRIÇÃO] RMS_SPEECH_THRESHOLD_DB inválido, usando padrão",
+                env_value=rms_threshold_env,
+                default=-50.0
+            )
+            self._rms_speech_threshold_db = -50.0
+        
         # ThreadPoolExecutor para executar faster-whisper em thread separada
         # faster-whisper é mais rápido mas ainda bloqueante, então executamos em thread separada
         # para não bloquear o event loop do asyncio
@@ -99,7 +114,8 @@ class TranscriptionService:
             device=self.device,
             language=self.language,
             max_concurrent_transcriptions=1,
-            min_audio_duration_sec=self._min_audio_duration_sec
+            min_audio_duration_sec=self._min_audio_duration_sec,
+            rms_speech_threshold_db=self._rms_speech_threshold_db
         )
     
     def _load_model(self):
@@ -1115,7 +1131,7 @@ class TranscriptionService:
             
             # P1.2: Detecção de silêncio RMS - rejeitar chunks sem fala antes da transcrição
             # Evita alucinações do Whisper em áudio silencioso ou muito quieto
-            has_speech = self._has_speech_rms(audio_array, sample_rate)
+            has_speech = self._has_speech_rms(audio_array, sample_rate, self._rms_speech_threshold_db)
             if not has_speech:
                 failure_reason = "no_speech_rms"
                 logger.debug(
