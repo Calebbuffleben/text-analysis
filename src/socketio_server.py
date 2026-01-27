@@ -153,6 +153,10 @@ async def _deep_audio_loop():
             )
 
             await _deep_redis.xack(_deep_audio_stream, _deep_consumer_group, entry_id)
+        except asyncio.CancelledError:
+            # Task was cancelled (usually during shutdown) - exit gracefully
+            logger.info("🛑 [DEEP_QUEUE] Consumer loop cancelled (shutdown requested)")
+            break
         except Exception as e:
             _deep_loop_consecutive_errors += 1
             logger.error(
