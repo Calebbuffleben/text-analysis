@@ -348,22 +348,43 @@ class TranscriptionService:
             
             t_after_preprocess = time.time() * 1000  # ms
             
-            # Verificar se pré-processamento foi bem-sucedido
-            if preprocess_result is None:
-                logger.warn(
-                    "⏭️ [TRANSCRIÇÃO] Pré-processamento rejeitou áudio (validação falhou)",
+            # NOVO: Verificar se áudio foi classificado como tendo fala
+            # Se has_speech=False, retornar imediatamente SEM processamento Whisper
+            if not preprocess_result.get('has_speech', False):
+                reason = preprocess_result.get('rejection_reason', 'unknown')
+                rms_db = preprocess_result.get('rms_max_db', -float('inf'))
+                audio_duration = preprocess_result.get('audio_duration_sec', 0.0)
+                
+                # Log de latência para áudio rejeitado rapidamente
+                logger.info(
+                    "[LATENCY] Audio rejected quickly",
+                    latencies_ms={
+                        'preprocess_only': round(t_after_preprocess - t_start, 2),
+                        'whisper_skipped': True,
+                        'total': round(t_after_preprocess - t_start, 2)
+                    },
+                    classification={
+                        'has_speech': False,
+                        'reason': reason,
+                        'rms_max_db': round(rms_db, 2),
+                        'rms_threshold_db': self._rms_speech_threshold_db,
+                        'audio_duration_sec': round(audio_duration, 3)
+                    },
                     audio_size_bytes=len(audio_data),
-                    sample_rate=sample_rate,
-                    reason="preprocess_result is None - possible causes: decode failed, no speech detected, audio too short after trim"
+                    note="Áudio descartado SEM custo de transcrição Whisper - pipeline continua fluindo"
                 )
+                
                 return {
                     'text': '',
                     'language': language or self.language,
                     'segments': [],
-                    'confidence': 0.0
+                    'confidence': 0.0,
+                    'has_speech': False,
+                    'rejection_reason': reason,
+                    'rms_max_db': rms_db
                 }
             
-            # Extrair dados do pré-processamento
+            # Se chegou aqui: has_speech=True, extrair dados do pré-processamento para transcrição
             audio_array = preprocess_result['audio_array']
             trim_info = preprocess_result['trim_info']
             estimated_snr_db = preprocess_result['estimated_snr_db']
@@ -681,9 +702,20 @@ class TranscriptionService:
                     'preprocess': round(t_after_preprocess - t_start, 2),
                     'transcription': round(t_after_transcription - t_after_preprocess, 2),
                     'total': round(t_after_transcription - t_start, 2),
+                    'whisper_skipped': False
                 },
-                text_length=len(text) if 'text' in locals() and text else 0,
-                confidence=result.get('confidence', 0.0) if result else 0.0,
+                classification={
+                    'has_speech': True,
+                    'rms_max_db': round(preprocess_result.get('rms_max_db', 0.0), 2),
+                    'rms_threshold_db': self._rms_speech_threshold_db,
+                    'audio_duration_sec_after_trim': round(preprocess_result.get('audio_duration_sec_after_trim', 0.0), 3)
+                },
+                result={
+                    'text_length': len(text) if 'text' in locals() and text else 0,
+                    'confidence': result.get('confidence', 0.0) if result else 0.0,
+                    'segments_count': len(segments) if 'segments' in locals() and segments else 0
+                },
+                note="Áudio com fala processado completamente via Whisper"
             )
             
             # Calcular confiança média dos segmentos (após filtro P3.1)
@@ -967,6 +999,60 @@ class TranscriptionService:
         
         return has_speech
     
+    def _has_speech_rms_with_level(self, audio_array: np.ndarray, sample_rate: int) -> tuple:
+        """
+        Detecta fala via RMS e retorna o nível máximo encontrado.
+        
+        Similar a _has_speech_rms, mas retorna também o nível RMS máximo em dB
+        para permitir logging e calibração do threshold.
+        
+        Args:
+            audio_array: Array numpy de áudio normalizado (-1 a 1)
+            sample_rate: Taxa de amostragem em Hz
+        
+        Returns:
+            Tuple[bool, float]: (has_speech, max_rms_db)
+                - has_speech: True se detectar fala, False caso contrário
+                - max_rms_db: Nível RMS máximo encontrado em dB
+        """
+        if len(audio_array) == 0:
+            return False, -float('inf')
+        
+        # Validar sample_rate antes de usar
+        if sample_rate <= 0:
+            logger.warn("⚠️ [PRÉ-PROCESSAMENTO] Sample rate inválido para detecção RMS", sample_rate=sample_rate)
+            return False, -float('inf')
+        
+        # Usar threshold configurado
+        rms_threshold_db = self._rms_speech_threshold_db
+        window_size_ms = 100
+        
+        # Converter threshold dB para linear (RMS)
+        rms_threshold_linear = 10 ** (rms_threshold_db / 20.0)
+        
+        # Calcular tamanho da janela em samples
+        window_samples = int(sample_rate * window_size_ms / 1000.0)
+        if window_samples < 1:
+            window_samples = 1
+        
+        # Calcular RMS em janelas sobrepostas
+        step_size = max(1, window_samples // 2)  # Overlap de 50%, mínimo 1
+        max_rms = 0.0
+        for i in range(0, len(audio_array), step_size):
+            window = audio_array[i:i + window_samples]
+            if len(window) == 0:
+                break
+            
+            # RMS = sqrt(mean(samples^2))
+            rms = np.sqrt(np.mean(window ** 2))
+            max_rms = max(max_rms, rms)
+        
+        # Converter para dB
+        max_rms_db = 20 * np.log10(max_rms + 1e-10)
+        has_speech = max_rms >= rms_threshold_linear
+        
+        return has_speech, max_rms_db
+    
     def _trim_silence(self, audio_array: np.ndarray, sample_rate: int,
                      silence_threshold_db: float = -35.0, frame_length_ms: int = 50,
                      hop_length_ms: int = 25):
@@ -1131,17 +1217,20 @@ class TranscriptionService:
         audio_data: bytes,
         sample_rate: int,
         language: Optional[str] = None
-    ) -> Optional[Dict[str, Any]]:
+    ) -> Dict[str, Any]:
         """
         Fase 1: Pré-processamento de áudio executado em thread separada (síncrono).
+        
+        NOVO: Funciona como CLASSIFICADOR, não como FILTRO BLOQUEANTE.
+        Sempre retorna resultado, com has_speech flag indicando se áudio tem fala.
         
         Encapsula todas as operações bloqueantes de pré-processamento:
         - Decodificação WAV
         - Validações de áudio
-        - Detecção de fala (RMS)
-        - Trim de silêncio
-        - Estimação de SNR
-        - Cálculo de parâmetros para transcrição
+        - Detecção de fala (RMS) - agora como classificador
+        - Trim de silêncio (apenas se has_speech=True)
+        - Estimação de SNR (apenas se has_speech=True)
+        - Cálculo de parâmetros para transcrição (apenas se has_speech=True)
         
         Esta função é executada no ThreadPoolExecutor para não bloquear o event loop.
         
@@ -1151,20 +1240,32 @@ class TranscriptionService:
             language: Idioma do áudio (opcional)
         
         Returns:
-            Dict com dados de pré-processamento se sucesso, None se validação falhar:
+            Dict SEMPRE retornado (nunca None):
+            
+            Se has_speech=False (áudio sem fala):
             {
-                'audio_array': np.ndarray,  # Áudio processado e validado
+                'has_speech': False,
+                'rejection_reason': str,  # 'decode_failed', 'too_short', 'no_speech_detected'
+                'rms_max_db': float,
+                'audio_duration_sec': float,
+                'rms_threshold_db': float
+            }
+            
+            Se has_speech=True (áudio com fala):
+            {
+                'has_speech': True,
+                'audio_array': np.ndarray,
                 'sample_rate': int,
                 'trim_info': dict,
                 'estimated_snr_db': float,
                 'beam_size': int,
                 'use_vad': bool,
                 'audio_duration_sec_after_trim': float,
-                'transcribe_options': dict  # Opções para model.transcribe()
+                'transcribe_options': dict,
+                'rms_max_db': float
             }
         """
         try:
-            failure_reason = None
             # Decodificar WAV para array numpy
             # O Whisper espera áudio como array numpy float32 normalizado (-1 a 1)
             audio_array = self._decode_wav(audio_data, sample_rate)
@@ -1176,7 +1277,13 @@ class TranscriptionService:
                     sample_rate=sample_rate,
                     reason="decode_wav retornou None ou array vazio"
                 )
-                return None
+                return {
+                    'has_speech': False,
+                    'rejection_reason': 'decode_failed',
+                    'rms_max_db': -float('inf'),
+                    'audio_duration_sec': 0.0,
+                    'rms_threshold_db': self._rms_speech_threshold_db
+                }
             
             # Filtrar chunks muito pequenos
             audio_duration_sec = len(audio_array) / sample_rate
@@ -1187,29 +1294,37 @@ class TranscriptionService:
                     min_duration_sec=self._min_audio_duration_sec,
                     reason="Áudio menor que mínimo antes de trim"
                 )
-                return None
+                return {
+                    'has_speech': False,
+                    'rejection_reason': 'too_short',
+                    'rms_max_db': -float('inf'),
+                    'audio_duration_sec': audio_duration_sec,
+                    'rms_threshold_db': self._rms_speech_threshold_db
+                }
             
-            # P1.2: Detecção de silêncio RMS - rejeitar chunks sem fala antes da transcrição
-            # Evita alucinações do Whisper em áudio silencioso ou muito quieto
-            has_speech = self._has_speech_rms(audio_array, sample_rate, self._rms_speech_threshold_db)
+            # P1.2: Detecção de fala RMS - AGORA COMO CLASSIFICADOR, NÃO FILTRO BLOQUEANTE
+            # Classifica áudio rapidamente como "fala" ou "silêncio" sem bloquear pipeline
+            has_speech, max_rms_db = self._has_speech_rms_with_level(audio_array, sample_rate)
+            
             if not has_speech:
-                failure_reason = "no_speech_rms"
+                # Áudio classificado como silêncio - retornar imediatamente SEM processamento pesado
+                # Pipeline continua fluindo, próximo áudio será processado sem espera
                 logger.debug(
-                    "⏭️ [PRÉ-PROCESSAMENTO] RMS não detectou fala",
+                    "⏭️ [CLASSIFICADOR] RMS classificou como silêncio",
                     audio_duration_sec=round(audio_duration_sec, 3),
-                    sample_rate=sample_rate,
-                    reason="has_speech_rms retornou False - possível silêncio apenas"
+                    rms_max_db=round(max_rms_db, 2),
+                    rms_threshold_db=self._rms_speech_threshold_db,
+                    reason="RMS abaixo do threshold - áudio descartado rapidamente"
                 )
-                # Fallback para buffers longos: evitar descartar conversa no fim
-                if audio_duration_sec >= 5.0:
-                    logger.warn(
-                        "⚠️ [PRÉ-PROCESSAMENTO] Fallback ativado (RMS sem fala, buffer longo)",
-                        audio_duration_sec=round(audio_duration_sec, 3),
-                        sample_rate=sample_rate,
-                        reason=failure_reason
-                    )
-                else:
-                    return None
+                return {
+                    'has_speech': False,
+                    'rejection_reason': 'no_speech_detected',
+                    'rms_max_db': max_rms_db,
+                    'audio_duration_sec': audio_duration_sec,
+                    'rms_threshold_db': self._rms_speech_threshold_db
+                }
+            
+            # Se chegou aqui: has_speech=True, continuar com pré-processamento completo
             
             # P1.3: Trim de silêncio inicial/final - remove silêncio que causa alucinações
             audio_array, trim_info = self._trim_silence(audio_array, sample_rate)
@@ -1220,9 +1335,8 @@ class TranscriptionService:
             audio_duration_sec_after_trim = len(audio_array) / sample_rate
             min_audio_after_trim_sec = 0.8  # REVISADO: Reduzido de 1.5s para 0.8s (era 0.5s antes de P4.2)
             if audio_duration_sec_after_trim < min_audio_after_trim_sec:
-                failure_reason = "too_short_after_trim"
                 logger.debug(
-                    "⏭️ [PRÉ-PROCESSAMENTO] Áudio muito curto após trim",
+                    "⏭️ [CLASSIFICADOR] Áudio muito curto após trim",
                     audio_duration_sec_before_trim=round(audio_duration_sec, 3),
                     audio_duration_sec_after_trim=round(audio_duration_sec_after_trim, 3),
                     min_audio_after_trim_sec=min_audio_after_trim_sec,
@@ -1230,22 +1344,14 @@ class TranscriptionService:
                     trim_end_sec=trim_info.get('trimmed_end_sec', 0),
                     reason=f"Áudio após trim ({audio_duration_sec_after_trim:.2f}s) menor que mínimo ({min_audio_after_trim_sec}s)"
                 )
-                # Fallback para buffers longos: usar áudio original sem trim
-                if audio_duration_sec >= 5.0:
-                    logger.warn(
-                        "⚠️ [PRÉ-PROCESSAMENTO] Fallback ativado (trim reduziu demais)",
-                        audio_duration_sec=round(audio_duration_sec, 3),
-                        audio_duration_sec_after_trim=round(audio_duration_sec_after_trim, 3),
-                        min_audio_after_trim_sec=min_audio_after_trim_sec,
-                        reason=failure_reason
-                    )
-                    audio_array = self._decode_wav(audio_data, sample_rate)
-                    if audio_array is None or len(audio_array) == 0:
-                        return None
-                    trim_info = {'trimmed_start_sec': 0, 'trimmed_end_sec': 0}
-                    audio_duration_sec_after_trim = len(audio_array) / sample_rate
-                else:
-                    return None
+                return {
+                    'has_speech': False,
+                    'rejection_reason': 'too_short_after_trim',
+                    'rms_max_db': max_rms_db,
+                    'audio_duration_sec': audio_duration_sec,
+                    'audio_duration_sec_after_trim': audio_duration_sec_after_trim,
+                    'rms_threshold_db': self._rms_speech_threshold_db
+                }
             
             # P2.2: Estimar SNR para VAD seletivo e ajuste de parâmetros
             estimated_snr_db = self._estimate_snr(audio_array, sample_rate)
@@ -1273,16 +1379,10 @@ class TranscriptionService:
                 'beam_size': beam_size,  # P2.3: Dinâmico conforme duração (5 para <10s, 7 para ≥10s)
                 'vad_filter': use_vad,  # P2.2: Seletivo baseado em SNR estimado
             }
-
-            # Se o fallback foi ativado, tornar a transcrição mais permissiva
-            if failure_reason in {"no_speech_rms", "too_short_after_trim"}:
-                transcribe_options = {
-                    **transcribe_options,
-                    'no_speech_threshold': 0.8,
-                    'vad_filter': False,
-                }
             
+            # Retornar resultado com has_speech=True e todos os dados de pré-processamento
             return {
+                'has_speech': True,
                 'audio_array': audio_array,
                 'sample_rate': sample_rate,
                 'trim_info': trim_info,
@@ -1290,12 +1390,25 @@ class TranscriptionService:
                 'beam_size': beam_size,
                 'use_vad': use_vad,
                 'audio_duration_sec_after_trim': audio_duration_sec_after_trim,
-                'transcribe_options': transcribe_options
+                'transcribe_options': transcribe_options,
+                'rms_max_db': max_rms_db
             }
         except Exception as e:
-            # Log de erro silencioso (será logado na função chamadora se necessário)
-            # Retornar None indica falha no pré-processamento
-            return None
+            logger.error(
+                "❌ [PRÉ-PROCESSAMENTO] Exceção durante pré-processamento",
+                error=str(e),
+                error_type=type(e).__name__,
+                audio_size_bytes=len(audio_data)
+            )
+            # Retornar resultado indicando falha
+            return {
+                'has_speech': False,
+                'rejection_reason': 'exception',
+                'rms_max_db': -float('inf'),
+                'audio_duration_sec': 0.0,
+                'rms_threshold_db': self._rms_speech_threshold_db,
+                'error': str(e)
+            }
     
     def _fix_common_transcription_errors(self, text: str) -> str:
         """
