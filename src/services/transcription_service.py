@@ -294,6 +294,8 @@ class TranscriptionService:
         result = service.transcribe_audio(wav_bytes, sample_rate=16000, language='pt')
         print(result['text'])  # "Olá, como você está?"
         """
+        t_start = time.time() * 1000  # ms
+        
         # Ensure model is loaded (thread-safe, idempotent)
         await self.ensure_model_loaded()
         
@@ -343,6 +345,8 @@ class TranscriptionService:
                 sample_rate,
                 language
             )
+            
+            t_after_preprocess = time.time() * 1000  # ms
             
             # Verificar se pré-processamento foi bem-sucedido
             if preprocess_result is None:
@@ -668,6 +672,19 @@ class TranscriptionService:
                         )
                     finally:
                         self._active_transcriptions -= 1
+            
+            t_after_transcription = time.time() * 1000  # ms
+            
+            logger.info(
+                "[LATENCY] Transcription timing",
+                latencies_ms={
+                    'preprocess': round(t_after_preprocess - t_start, 2),
+                    'transcription': round(t_after_transcription - t_after_preprocess, 2),
+                    'total': round(t_after_transcription - t_start, 2),
+                },
+                text_length=len(text) if 'text' in locals() and text else 0,
+                confidence=result.get('confidence', 0.0) if result else 0.0,
+            )
             
             # Calcular confiança média dos segmentos (após filtro P3.1)
             confidence = 0.0
