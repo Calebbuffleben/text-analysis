@@ -54,10 +54,33 @@ class TranscriptionService:
         self.task = Config.WHISPER_TASK
         
         # faster-whisper compute_type: "int8" para CPU (mais rápido), "float16" para GPU
+        # NÃO aceita "cpu" como valor - deve ser "int8" ou "float16"
         import os
-        compute_type_env = os.getenv('WHISPER_COMPUTE_TYPE', '')
+        compute_type_env = os.getenv('WHISPER_COMPUTE_TYPE', '').strip().lower()
         if compute_type_env:
-            self.compute_type = compute_type_env
+            # Validar e normalizar compute_type
+            # Converter valores legados/comuns para valores válidos
+            if compute_type_env == 'cpu':
+                # Valor legado: converter "cpu" para "int8"
+                self.compute_type = "int8"
+                logger.warn(
+                    "⚠️ [TRANSCRIÇÃO] WHISPER_COMPUTE_TYPE='cpu' é inválido, convertendo para 'int8'",
+                    old_value="cpu",
+                    new_value="int8",
+                    note="faster-whisper requer 'int8' ou 'float16' para CPU, não 'cpu'"
+                )
+            elif compute_type_env in ('int8', 'int8_float16', 'float16'):
+                # Valores válidos do faster-whisper
+                self.compute_type = compute_type_env
+            else:
+                # Valor inválido: usar padrão baseado no device
+                logger.warn(
+                    "⚠️ [TRANSCRIÇÃO] WHISPER_COMPUTE_TYPE inválido, usando padrão baseado em device",
+                    invalid_value=compute_type_env,
+                    device=self.device,
+                    note="Valores válidos: 'int8', 'int8_float16', 'float16'"
+                )
+                self.compute_type = "int8" if self.device == "cpu" else "float16"
         else:
             # Auto-detect: int8 para CPU, float16 para GPU
             self.compute_type = "int8" if self.device == "cpu" else "float16"
@@ -199,7 +222,8 @@ class TranscriptionService:
         load_start = time.perf_counter()
         
         try:
-            # faster-whisper aceita "cpu" ou "cuda" diretamente
+            # faster-whisper compute_type deve ser "int8", "int8_float16" ou "float16"
+            # device deve ser "cpu" ou "cuda"
             # Ele mesmo verifica se CUDA está disponível, então não precisamos verificar manualmente
             device = self.device
             compute_type = self.compute_type
