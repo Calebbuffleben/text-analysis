@@ -18,6 +18,7 @@ import soundfile as sf
 from threading import Lock
 from faster_whisper import WhisperModel
 import numpy as np
+from scipy.ndimage import uniform_filter1d
 from typing import Optional, Dict, Any, List
 from concurrent.futures import ThreadPoolExecutor
 from ..config import Config
@@ -858,14 +859,10 @@ class TranscriptionService:
     def _decode_wav(self, wav_data: bytes, expected_sample_rate: int) -> Optional[np.ndarray]:
         """
         Decodifica dados WAV para array numpy usando soundfile.
-        
-        Suporta formatos WAV PCM (16/24/32-bit) e float, mono ou estéreo.
-        O soundfile lida automaticamente com a decodificação e normalização.
-        
+        O soundfile lida automaticamente com a decodificação e normalização.     
         Args:
             wav_data: Bytes do arquivo WAV (incluindo header)
             expected_sample_rate: Taxa de amostragem desejada (Hz)
-        
         Returns:
             Array numpy float32 normalizado (-1.0 a 1.0), mono, na taxa expected_sample_rate.
             None em caso de erro na decodificação.
@@ -911,6 +908,29 @@ class TranscriptionService:
             logger.error("Failed to decode WAV", error=str(e))
             return None
     
+    def _rms_max_over_windows(self, audio_array: np.ndarray, window_samples: int) -> float:
+        """
+        Usa média móvel (uniform_filter1d) sobre o sinal ao quadrado para obter
+        RMS por "frame" e retorna o máximo.
+        
+        Args:
+            audio_array: Array numpy de áudio normalizado (-1 a 1)
+            window_samples: Tamanho da janela em amostras (>= 1)
+        
+        Returns:
+            Máximo RMS encontrado em qualquer janela (linear, não dB).
+            Retorna 0.0 se audio_array estiver vazio.
+        """
+        if len(audio_array) == 0:
+            return 0.0
+        if window_samples < 1:
+            window_samples = 1
+        size = min(window_samples, len(audio_array))
+        squared = audio_array.astype(np.float64) ** 2
+        mean_sq = uniform_filter1d(squared, size=size, mode='constant', cval=0.0)
+        rms_per_frame = np.sqrt(np.maximum(mean_sq, 0.0))
+        return float(np.max(rms_per_frame))
+    
     def _has_speech_rms(self, audio_array: np.ndarray, sample_rate: int, 
                        rms_threshold_db: float = -40.0, window_size_ms: int = 100) -> bool:
         """
@@ -946,19 +966,7 @@ class TranscriptionService:
         if window_samples < 1:
             window_samples = 1
         
-        # Calcular RMS em janelas sobrepostas
-        # Garantir que step_size nunca seja 0 (proteger contra window_samples = 1)
-        step_size = max(1, window_samples // 2)  # Overlap de 50%, mínimo 1
-        max_rms = 0.0
-        for i in range(0, len(audio_array), step_size):
-            window = audio_array[i:i + window_samples]
-            if len(window) == 0:
-                break
-            
-            # RMS = sqrt(mean(samples^2))
-            rms = np.sqrt(np.mean(window ** 2))
-            max_rms = max(max_rms, rms)
-        
+        max_rms = self._rms_max_over_windows(audio_array, window_samples)
         has_speech = max_rms >= rms_threshold_linear
         
         logger.info(
@@ -1007,18 +1015,7 @@ class TranscriptionService:
         if window_samples < 1:
             window_samples = 1
         
-        # Calcular RMS em janelas sobrepostas
-        step_size = max(1, window_samples // 2)  # Overlap de 50%, mínimo 1
-        max_rms = 0.0
-        for i in range(0, len(audio_array), step_size):
-            window = audio_array[i:i + window_samples]
-            if len(window) == 0:
-                break
-            
-            # RMS = sqrt(mean(samples^2))
-            rms = np.sqrt(np.mean(window ** 2))
-            max_rms = max(max_rms, rms)
-        
+        max_rms = self._rms_max_over_windows(audio_array, window_samples)
         # Converter para dB
         max_rms_db = 20 * np.log10(max_rms + 1e-10)
         has_speech = max_rms >= rms_threshold_linear
