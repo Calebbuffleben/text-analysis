@@ -14,6 +14,7 @@ import asyncio
 import time
 import re
 import structlog
+import soundfile as sf
 from threading import Lock
 from faster_whisper import WhisperModel
 import numpy as np
@@ -856,86 +857,55 @@ class TranscriptionService:
     
     def _decode_wav(self, wav_data: bytes, expected_sample_rate: int) -> Optional[np.ndarray]:
         """
-        Decodifica dados WAV para array numpy.
+        Decodifica dados WAV para array numpy usando soundfile.
         
-        O formato WAV esperado:
-        - Header de 44 bytes
-        - Dados PCM16LE (16-bit little-endian)
-        - Mono ou estéreo
+        Suporta formatos WAV PCM (16/24/32-bit) e float, mono ou estéreo.
+        O soundfile lida automaticamente com a decodificação e normalização.
         
-        Retorna:
-        - Array numpy float32 normalizado (-1.0 a 1.0)
-        - Taxa de amostragem ajustada se necessário
+        Args:
+            wav_data: Bytes do arquivo WAV (incluindo header)
+            expected_sample_rate: Taxa de amostragem desejada (Hz)
+        
+        Returns:
+            Array numpy float32 normalizado (-1.0 a 1.0), mono, na taxa expected_sample_rate.
+            None em caso de erro na decodificação.
         """
         try:
-            import wave
+            # Ler WAV usando soundfile (suporta PCM 16/24/32-bit e float nativamente)
+            # soundfile já retorna float32 normalizado em [-1, 1]
+            audio_float, sample_rate = sf.read(io.BytesIO(wav_data), dtype='float32')
             
-            # Criar arquivo WAV em memória
-            wav_file = io.BytesIO(wav_data)
+            # Converter estéreo para mono (média dos canais)
+            if audio_float.ndim == 2:
+                audio_float = audio_float.mean(axis=1)
             
-            # Ler WAV usando wave module
-            with wave.open(wav_file, 'rb') as wf:
-                sample_rate = wf.getframerate()
-                num_channels = wf.getnchannels()
-                sample_width = wf.getsampwidth()
-                num_frames = wf.getnframes()
-                
-                # Ler dados de áudio
-                audio_bytes = wf.readframes(num_frames)
-                
-                # Converter bytes para array numpy
-                if sample_width == 2:  # 16-bit
-                    audio_array = np.frombuffer(audio_bytes, dtype=np.int16)
-                elif sample_width == 4:  # 32-bit
-                    audio_array = np.frombuffer(audio_bytes, dtype=np.int32)
-                else:
-                    logger.warn(f"Unsupported sample width: {sample_width}")
-                    return None
-                
-                # Converter para float32 e normalizar (-1.0 a 1.0)
-                # Para int16: dividir por 32768.0
-                # Para int32: dividir por 2147483648.0
-                if sample_width == 2:
-                    audio_float = audio_array.astype(np.float32) / 32768.0
-                else:
-                    audio_float = audio_array.astype(np.float32) / 2147483648.0
-                
-                # Converter estéreo para mono (média dos canais)
-                if num_channels == 2:
-                    # Garantir que o array tenha número par de samples para reshape
-                    if len(audio_float) % 2 != 0:
-                        # Se ímpar, remover último sample para permitir reshape
-                        audio_float = audio_float[:-1]
-                    if len(audio_float) >= 2:
-                        audio_float = audio_float.reshape(-1, 2).mean(axis=1)
-                    # Se após remoção ficou muito curto (< 2), manter como está (tratar como mono)
-                
-                # Resample se necessário (Whisper funciona melhor com 16kHz)
-                # Nota: Se o áudio já estiver em 16kHz, não precisa resample
-                if sample_rate != expected_sample_rate:
-                    try:
-                        from scipy import signal
-                        num_samples = int(len(audio_float) * expected_sample_rate / sample_rate)
-                        if num_samples > 0:
-                            audio_float = signal.resample(audio_float, num_samples)
-                            logger.debug(
-                                "Audio resampled",
-                                from_rate=sample_rate,
-                                to_rate=expected_sample_rate,
-                                original_samples=len(audio_array),
-                                resampled_samples=num_samples
-                            )
-                        else:
-                            logger.warn("Invalid resample target, keeping original sample rate")
-                    except ImportError:
-                        logger.warn("scipy not available, skipping resample - Whisper will handle it")
-                        # Whisper pode lidar com diferentes sample rates, mas 16kHz é ideal
-                    except Exception as e:
-                        logger.warn(f"Resample failed: {e}, keeping original sample rate")
-                else:
-                    logger.debug("Audio already at target sample rate, no resample needed")
-                
-                return audio_float
+            # Resample se necessário (Whisper funciona melhor com 16kHz)
+            # Nota: Se o áudio já estiver na taxa esperada, não precisa resample
+            if sample_rate != expected_sample_rate:
+                try:
+                    from scipy import signal
+                    original_samples = len(audio_float)
+                    num_samples = int(original_samples * expected_sample_rate / sample_rate)
+                    if num_samples > 0:
+                        audio_float = signal.resample(audio_float, num_samples)
+                        logger.debug(
+                            "Audio resampled",
+                            from_rate=sample_rate,
+                            to_rate=expected_sample_rate,
+                            original_samples=original_samples,
+                            resampled_samples=num_samples
+                        )
+                    else:
+                        logger.warn("Invalid resample target, keeping original sample rate")
+                except ImportError:
+                    logger.warn("scipy not available, skipping resample - Whisper will handle it")
+                    # Whisper pode lidar com diferentes sample rates, mas 16kHz é ideal
+                except Exception as e:
+                    logger.warn(f"Resample failed: {e}, keeping original sample rate")
+            else:
+                logger.debug("Audio already at target sample rate, no resample needed")
+            
+            return audio_float
                 
         except Exception as e:
             logger.error("Failed to decode WAV", error=str(e))
