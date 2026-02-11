@@ -385,12 +385,19 @@ class TranscriptionService:
                 }
             
             # Se chegou aqui: has_speech=True, extrair dados do pré-processamento para transcrição
+            # Dado do áudio decodificado e processado para transcrição            
             audio_array = preprocess_result['audio_array']
+            # Informações do trim de silêncio
             trim_info = preprocess_result['trim_info']
+            # SNR estimado
             estimated_snr_db = preprocess_result['estimated_snr_db']
+            # Tamanho do beam search
             beam_size = preprocess_result['beam_size']
+            # Se o VAD foi usado
             use_vad = preprocess_result['use_vad']
+            # Duração do áudio após o trim de silêncio
             audio_duration_sec_after_trim = preprocess_result['audio_duration_sec_after_trim']
+            # Opções de transcrição
             transcribe_options = preprocess_result['transcribe_options']
             
             logger.debug(
@@ -413,7 +420,7 @@ class TranscriptionService:
                 device=self.device
             )
             
-            # FASE 3: Transcrição (semáforo + executor)
+            # Transcrição com Whisper (semáforo + executor)
             # O semáforo é usado APENAS para limitar transcrições simultâneas do Whisper
             # Pré-processamento já foi executado no executor, fora do semáforo
             # Isso garante que o event loop permanece livre durante pré-processamento
@@ -428,7 +435,7 @@ class TranscriptionService:
                 active_transcriptions=self._active_transcriptions
             )
             
-            # FASE 3: Adquirir semáforo APENAS para transcrição do Whisper
+            # Adquirir semáforo APENAS para transcrição do Whisper
             # Pré-processamento não precisa do semáforo (já executado no executor)
             # Semáforo garante que apenas uma transcrição Whisper execute por vez
             
@@ -460,64 +467,36 @@ class TranscriptionService:
                     
                     # Criar função de transcrição para o executor
                     # faster-whisper retorna (segments, info) ao invés de dict
+                    # Referenciar model, audio, options, language e sample_rate no closure
                     model_ref = self.model
+                    # Copiar audio_array para evitar modificações no original
                     audio_ref = audio_array.copy()
+                    # Copiar options para evitar modificações no original
                     options_ref = transcribe_options.copy()
-                    language_ref = language or self.language  # Capturar language no closure
-                    sample_rate_ref = preprocess_result['sample_rate']  # Capturar sample_rate no closure
-                    
+                    # Capturar language no closure
+                    language_ref = language or self.language 
+                    # Capturar sample_rate no closure
+                    sample_rate_ref = preprocess_result['sample_rate']  
+                    # Criar função de transcrição para o executor
                     def transcribe_sync():
                         try:
                             # faster-whisper retorna (segments, info)
+                            # Transcrição com Whisper (semáforo + executor)
                             # segments é um iterador de objetos Segment
                             segments, info = model_ref.transcribe(audio_ref, **options_ref)
                             
                             # Converter segments para lista e processar
                             segments_list = list(segments)
                             
-                            # P3.1: Filtrar segmentos por no_speech_prob e avg_logprob antes de concatenar
-                            # Ignorar segmentos com alta probabilidade de não ter fala ou baixa confiança
-                            # Isso remove alucinações já detectadas pelo Whisper
-                            filtered_segments = []
-                            filtered_count = 0
-                            for seg in segments_list:
-                                no_speech_prob = getattr(seg, 'no_speech_prob', 0.0)
-                                avg_logprob = getattr(seg, 'avg_logprob', 0.0)
-                                
-                                # Manter apenas segmentos com:
-                                # - no_speech_prob <= 0.6 (probabilidade de não ter fala baixa)
-                                # - avg_logprob > -1.0 (confiança razoável)
-                                if no_speech_prob <= 0.6 and avg_logprob > -1.0:
-                                    filtered_segments.append(seg)
-                                else:
-                                    filtered_count += 1
-
-                            used_unfiltered_segments = False
-                            # Se o filtro removeu TUDO mas o Whisper retornou segmentos, preferimos
-                            # retornar os segmentos originais ao invés de "sumir" com o texto.
-                            # Isso evita falsos "segments_count=0" que quebram o pipeline no fim da conversa.
-                            if len(segments_list) > 0 and len(filtered_segments) == 0:
-                                used_unfiltered_segments = True
-                                filtered_segments = segments_list
+                            # Construir texto completo concatenando todos os segmentos
+                            text = " ".join(seg.text for seg in segments_list).strip()
                             
-                            # Construir texto completo concatenando apenas segmentos filtrados
-                            text = " ".join(seg.text for seg in filtered_segments).strip()
-                            
-                            # FASE 3: Aplicar pós-processamento para corrigir erros comuns de transcrição
+                            # Aplicar pós-processamento para corrigir erros comuns de transcrição
                             text = self._fix_common_transcription_errors(text)
                             
-                            # Log de filtragem para diagnóstico
-                            if filtered_count > 0:
-                                logger.debug(
-                                    "🔍 [P3.1] Segmentos filtrados",
-                                    total_segments=len(segments_list),
-                                    filtered_out=filtered_count,
-                                    kept_segments=len(filtered_segments)
-                                )
-                            
-                            # Converter segments filtrados para formato dict compatível
+                            # Converter segments para formato dict compatível
                             segments_dict = []
-                            for seg in filtered_segments:
+                            for seg in segments_list:
                                 segments_dict.append({
                                     'start': seg.start,
                                     'end': seg.end,
@@ -534,7 +513,6 @@ class TranscriptionService:
                                 'language_probability': getattr(info, 'language_probability', 1.0),
                                 'segments': segments_dict,
                                 '_raw_segments_count': len(segments_list),
-                                '_used_unfiltered_segments': used_unfiltered_segments,
                                 'duration': getattr(info, 'duration', len(audio_ref) / sample_rate_ref)
                             }
                         except Exception as e:
@@ -1230,7 +1208,7 @@ class TranscriptionService:
         - Detecção de fala (RMS) - agora como classificador
         - Trim de silêncio (apenas se has_speech=True)
         - Estimação de SNR (apenas se has_speech=True)
-        - Cálculo de parâmetros para transcrição (apenas se has_speech=True)
+        - Cálculo de parâmetros para transcrição (apenas se has_speech=True)    
         
         Esta função é executada no ThreadPoolExecutor para não bloquear o event loop.
         
