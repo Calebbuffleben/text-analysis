@@ -1,14 +1,3 @@
-"""
-Serviço de transcrição de áudio usando faster-whisper.
-Recebe chunks de áudio WAV e retorna transcrições em texto.
-
-faster-whisper é uma implementação otimizada do Whisper que:
-- É mais rápida (até 4x mais rápida que openai-whisper)
-- Usa menos memória
-- Suporta os mesmos modelos (tiny, base, small, medium, large)
-- Funciona melhor em CPU com compute_type="int8"
-"""
-
 import io
 import asyncio
 import time
@@ -29,16 +18,6 @@ logger = structlog.get_logger()
 class TranscriptionService:
     """
     Serviço de transcrição de áudio usando faster-whisper.
-    
-    faster-whisper é uma implementação otimizada do Whisper da OpenAI,
-    otimizada para múltiplos idiomas incluindo português.
-    
-    Características:
-    - Suporta múltiplos idiomas (português incluído)
-    - Modelos leves disponíveis (tiny, base, small, medium, large)
-    - Funciona em CPU e GPU
-    - Mais rápido e eficiente que openai-whisper
-    - Lazy loading do modelo (carrega apenas quando necessário)
     """
     
     def __init__(self):
@@ -153,31 +132,19 @@ class TranscriptionService:
         """
         Pre-load model during startup. Thread-safe and idempotent.
         Can be called multiple times safely - only loads once.
-        
-        This method uses double-check locking pattern to ensure:
-        1. Only one thread loads the model at a time
-        2. If model is already loaded, returns immediately
-        3. If another thread is loading, waits for it to complete
         """
-        # Fast path: already loaded
         if self._loaded:
             return
         
-        # Acquire lock to check/set loading state
         with self._load_lock:
-            # Double-check pattern: another thread might have loaded while waiting
             if self._loaded:
                 return
             
-            # Check if another thread is currently loading
             if self._loading:
-                # Release lock and wait for loading to complete
                 pass
             else:
-                # This thread will load the model
                 self._loading = True
-        
-        # If we set _loading to True, we're responsible for loading
+
         if self._loading and not self._loaded:
             try:
                 loop = asyncio.get_running_loop()
@@ -187,7 +154,6 @@ class TranscriptionService:
                 with self._load_lock:
                     self._loading = False
         else:
-            # Another thread is loading, wait for it
             while self._loading and not self._loaded:
                 await asyncio.sleep(0.1)
     
@@ -202,13 +168,6 @@ class TranscriptionService:
         - medium: ~769M parâmetros, muito preciso
         - large: ~1550M parâmetros, mais preciso, mais lento
         
-        O modelo escolhido (base por padrão) oferece bom equilíbrio
-        entre velocidade e precisão para transcrições em tempo real.
-        
-        faster-whisper é mais rápido que openai-whisper, especialmente em CPU
-        com compute_type="int8".
-        
-        Thread-safe: Should only be called from ensure_model_loaded() which handles locking.
         """
         # Double-check: already loaded
         if self._loaded:
@@ -330,7 +289,6 @@ class TranscriptionService:
             self._transcription_semaphore = asyncio.Semaphore(self._max_concurrent)
         
         try:
-            # FASE 2: Validações rápidas (<1ms, no event loop)
             # Validações que não bloqueiam o event loop
             if sample_rate <= 0:
                 logger.warn(
@@ -344,7 +302,6 @@ class TranscriptionService:
                     'confidence': 0.0
                 }
             
-            # FASE 2: Pré-processamento no executor (não bloqueia event loop)
             # Todas as operações bloqueantes (decode_wav, RMS, trim, SNR) são executadas
             # em thread separada, permitindo que o event loop processe outros eventos
             # (ex: health_ping, outros handlers Socket.IO)
@@ -361,7 +318,6 @@ class TranscriptionService:
                 expected_sample_rate=sample_rate
             )
             
-            # Executar pré-processamento no executor (FASE 2)
             # Operações bloqueantes: _decode_wav(), _has_speech_rms(), _trim_silence(), _estimate_snr()
             # Isso libera o event loop para processar outros eventos (ex: health_ping)
             preprocess_result = await loop.run_in_executor(
@@ -374,7 +330,7 @@ class TranscriptionService:
             
             t_after_preprocess = time.time() * 1000  # ms
             
-            # NOVO: Verificar se áudio foi classificado como tendo fala
+            # Verificar se áudio foi classificado como tendo fala
             # Se has_speech=False, retornar imediatamente SEM processamento Whisper
             if not preprocess_result.get('has_speech', False):
                 reason = preprocess_result.get('rejection_reason', 'unknown')
@@ -544,8 +500,7 @@ class TranscriptionService:
                         except Exception as e:
                             logger.error(f"Erro dentro do transcribe_sync: {e}")
                             raise
-                    
-                    # Adicionar timeout de 30 segundos
+
                     # faster-whisper é mais rápido: tiny < 2s, base < 5s, small < 10s para 8s de áudio
                     task = loop.run_in_executor(self._executor, transcribe_sync)
                     result = await asyncio.wait_for(task, timeout=30.0)
@@ -934,8 +889,6 @@ class TranscriptionService:
     def _has_speech_rms(self, audio_array: np.ndarray, sample_rate: int, 
                        rms_threshold_db: float = -40.0, window_size_ms: int = 100) -> bool:
         """
-        P1.2: Detecta se o áudio contém fala baseado em RMS (Root Mean Square).
-        
         Calcula RMS em janelas curtas e verifica se algum trecho tem energia suficiente
         para indicar fala. Mais leve que VAD completo e eficaz para filtrar silêncio.
         
@@ -1026,8 +979,6 @@ class TranscriptionService:
                      silence_threshold_db: float = -35.0, frame_length_ms: int = 50,
                      hop_length_ms: int = 25):
         """
-        P1.3: Remove silêncio inicial e final do áudio.
-        
         Remove períodos de silêncio que causam alucinações do Whisper.
         Mantém padding mínimo para preservar contexto de fala.
         
@@ -1122,8 +1073,6 @@ class TranscriptionService:
     def _estimate_snr(self, audio_array: np.ndarray, sample_rate: int,
                      frame_length_ms: int = 100) -> float:
         """
-        P2.2: Estima SNR (Signal-to-Noise Ratio) do áudio usando análise de energia.
-        
         Calcula diferença entre energia em regiões de fala vs silêncio.
         Usado para decidir se VAD pode ser usado com segurança.
         
@@ -1146,19 +1095,15 @@ class TranscriptionService:
         if frame_samples < 1:
             frame_samples = 1
         
-        # Calcular energia RMS por frame
-        frame_energies = []
-        for i in range(0, len(audio_array), frame_samples):
-            frame = audio_array[i:i + frame_samples]
-            if len(frame) == 0:
-                break
-            rms = np.sqrt(np.mean(frame ** 2))
-            frame_energies.append(rms)
-        
-        if len(frame_energies) < 2:
+        # Calcular energia RMS por frame usando numpy vetorizado
+        num_frames = len(audio_array) // frame_samples
+        if num_frames < 2:
             return -999.0
         
-        frame_energies = np.array(frame_energies)
+        # Truncar para múltiplos de frame_samples e reshape em matriz
+        truncated = audio_array[:num_frames * frame_samples]
+        frames = truncated.reshape(num_frames, frame_samples)
+        frame_energies = np.sqrt(np.mean(frames**2, axis=1))
         
         # Estimar energia de sinal (frames com maior energia - percentil 75)
         # Estimar energia de ruído (frames com menor energia - percentil 25)
@@ -1188,11 +1133,6 @@ class TranscriptionService:
         language: Optional[str] = None
     ) -> Dict[str, Any]:
         """
-        Fase 1: Pré-processamento de áudio executado em thread separada (síncrono).
-        
-        NOVO: Funciona como CLASSIFICADOR, não como FILTRO BLOQUEANTE.
-        Sempre retorna resultado, com has_speech flag indicando se áudio tem fala.
-        
         Encapsula todas as operações bloqueantes de pré-processamento:
         - Decodificação WAV
         - Validações de áudio
@@ -1209,8 +1149,6 @@ class TranscriptionService:
             language: Idioma do áudio (opcional)
         
         Returns:
-            Dict SEMPRE retornado (nunca None):
-            
             Se has_speech=False (áudio sem fala):
             {
                 'has_speech': False,
@@ -1271,7 +1209,6 @@ class TranscriptionService:
                     'rms_threshold_db': self._rms_speech_threshold_db
                 }
             
-            # P1.2: Detecção de fala RMS - AGORA COMO CLASSIFICADOR, NÃO FILTRO BLOQUEANTE
             # Classifica áudio rapidamente como "fala" ou "silêncio" sem bloquear pipeline
             has_speech, max_rms_db = self._has_speech_rms_with_level(audio_array, sample_rate)
             
@@ -1295,12 +1232,8 @@ class TranscriptionService:
             
             # Se chegou aqui: has_speech=True, continuar com pré-processamento completo
             
-            # P1.3: Trim de silêncio inicial/final - remove silêncio que causa alucinações
             audio_array, trim_info = self._trim_silence(audio_array, sample_rate)
             
-            # REVISADO P4.2: Verificar se após trim ainda há áudio suficiente para transcrição confiável
-            # Reduzido de 1.5s para 0.8s para permitir transcrições de áudio mais curto
-            # 1.5s era muito restritivo e rejeitava áudio válido (ex: respostas curtas)
             audio_duration_sec_after_trim = len(audio_array) / sample_rate
             min_audio_after_trim_sec = 0.8  # REVISADO: Reduzido de 1.5s para 0.8s (era 0.5s antes de P4.2)
             if audio_duration_sec_after_trim < min_audio_after_trim_sec:
@@ -1322,21 +1255,14 @@ class TranscriptionService:
                     'rms_threshold_db': self._rms_speech_threshold_db
                 }
             
-            # P2.2: Estimar SNR para VAD seletivo e ajuste de parâmetros
             estimated_snr_db = self._estimate_snr(audio_array, sample_rate)
             
-            # P2.3: Ajustar beam_size conforme duração do áudio
             # Áudio mais longo se beneficia de beam search maior
             beam_size = 7 if audio_duration_sec_after_trim >= 10.0 else 5
             
-            # P2.2: VAD seletivo - ativar apenas se SNR for suficientemente alto
             # SNR alto = áudio limpo = VAD seguro. SNR baixo = risco de remover fala válida
             use_vad = estimated_snr_db > 10.0  # Threshold de 10dB para considerar áudio "limpo"
             
-            # P2.1: Ajustar thresholds baseado em qualidade de áudio para reduzir alucinações
-            # no_speech_threshold: 0.5 (mais restritivo que 0.3, menos alucinações)
-            # log_prob_threshold: -1.0 (menos restritivo que -0.8, não corta fala válida)
-            # compression_ratio_threshold: 2.4 (menos agressivo que 2.0, permite repetições naturais)
             transcribe_options = {
                 'language': language or self.language,
                 'task': self.task,  # 'transcribe' ou 'translate'
@@ -1381,26 +1307,14 @@ class TranscriptionService:
     
     def _fix_common_transcription_errors(self, text: str) -> str:
         """
-        FASE 3: Corrige erros comuns de transcrição do Whisper em português.
-        
         Corrige erros de transcrição frequentes onde o Whisper separa incorretamente
         palavras compostas (ex: "a diário" → "adiar").
-        
-        Esta função apenas corrige erros, não rejeita texto, garantindo que
-        feedbacks válidos não sejam bloqueados.
-        
-        Args:
-            text: Texto transcrito a ser corrigido
-        
-        Returns:
-            Texto corrigido
         """
         if not text:
             return text
         
         original_text = text
         
-        # Correções de palavras comuns (erros frequentes do Whisper em português)
         corrections = [
             # Erro: "preciso a diário" → correto: "preciso adiar"
             (r'\bpreciso\s+a\s+diário\b', 'preciso adiar', re.IGNORECASE),
