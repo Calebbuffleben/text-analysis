@@ -195,6 +195,22 @@ _result_dedupe_cache = TTLCache(
     ttl=Config.RESULT_DEDUPE_TTL_SEC,
 )
 
+_result_rate_limit = TTLCache(
+    maxsize=Config.RESULT_DEDUPE_MAX_SIZE,
+    ttl=Config.RESULT_MIN_INTERVAL_SEC,
+)
+
+
+def _text_similar(a: str, b: str, threshold: float = 0.6) -> bool:
+    """Jaccard similarity on word sets — catches near-duplicate overlapping-window transcriptions."""
+    words_a = set(a.lower().split())
+    words_b = set(b.lower().split())
+    if not words_a or not words_b:
+        return a == b
+    intersection = words_a & words_b
+    union = words_a | words_b
+    return len(intersection) / len(union) >= threshold
+
 
 async def on_buffer_ready(meeting_id: str, participant_id: str, track: str,
                          wav_data: bytes, sample_rate: int, channels: int, timestamp: int,
@@ -267,16 +283,27 @@ async def on_buffer_ready(meeting_id: str, participant_id: str, track: str,
             'total_processing_time_ms': t5_processing_complete - timestamp,
         }
         
-        dedupe_key = (meeting_id, participant_id)
-        fingerprint = text
-        if _result_dedupe_cache.get(dedupe_key) == fingerprint:
+        rate_key = (meeting_id, participant_id)
+        if rate_key in _result_rate_limit:
             logger.debug(
-                "🧩 [DEDUPE] Resultado duplicado ignorado",
+                "⏱️ [RATE_LIMIT] Result rate-limited (one per %.1fs per participant)",
+                Config.RESULT_MIN_INTERVAL_SEC,
                 meeting_id=meeting_id,
                 participant_id=participant_id,
             )
             return
-        _result_dedupe_cache[dedupe_key] = fingerprint
+        
+        dedupe_key = (meeting_id, participant_id)
+        cached_text = _result_dedupe_cache.get(dedupe_key)
+        if cached_text is not None and _text_similar(cached_text, text):
+            logger.debug(
+                "🧩 [DEDUPE] Near-duplicate result ignored (Jaccard similarity)",
+                meeting_id=meeting_id,
+                participant_id=participant_id,
+            )
+            return
+        _result_dedupe_cache[dedupe_key] = text
+        _result_rate_limit[rate_key] = True
 
         # Escolher um caminho: Redis (queue) OU Socket.IO (direct), não ambos
         if _deep_queue_enabled and _deep_redis_url:

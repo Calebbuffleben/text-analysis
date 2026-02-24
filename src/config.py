@@ -53,6 +53,9 @@ class _Settings(BaseSettings):
     RESULT_DEDUPE_TTL_SEC: float = 6.0
     RESULT_DEDUPE_MAX_SIZE: int = 20000
 
+    # Rate limiter: minimum interval between result emissions per participant
+    RESULT_MIN_INTERVAL_SEC: float = 5.0
+
     @field_validator("SOCKETIO_CORS_ORIGINS", mode="before")
     @classmethod
     def _split_cors_origins(cls, v: Any) -> List[str]:
@@ -131,6 +134,7 @@ class Config:
     CONTINUOUS_TICK_SEC = _settings.CONTINUOUS_TICK_SEC
     RESULT_DEDUPE_TTL_SEC = _settings.RESULT_DEDUPE_TTL_SEC
     RESULT_DEDUPE_MAX_SIZE = _settings.RESULT_DEDUPE_MAX_SIZE
+    RESULT_MIN_INTERVAL_SEC = _settings.RESULT_MIN_INTERVAL_SEC
 
     @classmethod
     def validate(cls):
