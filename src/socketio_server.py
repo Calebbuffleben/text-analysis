@@ -246,6 +246,9 @@ async def on_buffer_ready(meeting_id: str, participant_id: str, track: str,
         )
         
         # Analisar texto com BERT
+        if analysis_service is None:
+            logger.error("❌ [BUFFER] AnalysisService não disponível")
+            return
         analysis_result = await analysis_service.analyze(chunk)
         
         # Criar resposta
@@ -552,6 +555,9 @@ async def transcription_chunk(sid, data: Dict[str, Any]):
             participant_id=participant_id,
             text_length=len(chunk.text)
         )
+        if analysis_service is None:
+            logger.error("❌ [FLUXO] AnalysisService não disponível")
+            return
         analysis_result = await analysis_service.analyze(chunk)
         
         logger.debug(
