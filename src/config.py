@@ -1,7 +1,8 @@
+import json
 from typing import Any, List
 
 from pydantic import Field, ValidationError, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 class _Settings(BaseSettings):
@@ -14,7 +15,7 @@ class _Settings(BaseSettings):
     LOG_LEVEL: str = "INFO"
 
     # Socket.IO Configuration
-    SOCKETIO_CORS_ORIGINS: List[str] = Field(default_factory=lambda: ["*"])
+    SOCKETIO_CORS_ORIGINS: NoDecode[List[str]] = Field(default_factory=lambda: ["*"])
 
     # ML Model Configuration
     MODEL_NAME: str = "neuralmind/bert-base-portuguese-cased"
@@ -56,7 +57,27 @@ class _Settings(BaseSettings):
     @classmethod
     def _split_cors_origins(cls, v: Any) -> List[str]:
         if isinstance(v, str):
-            return [x.strip() for x in v.split(",") if x.strip()]
+            raw = v.strip()
+            if raw == "":
+                raise ValueError(
+                    "SOCKETIO_CORS_ORIGINS must be a JSON array string, e.g. "
+                    '["http://localhost:3000"]'
+                )
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    "SOCKETIO_CORS_ORIGINS must be valid JSON array syntax, e.g. "
+                    '["http://localhost:3000"] or []'
+                ) from exc
+            if not isinstance(parsed, list):
+                raise ValueError(
+                    "SOCKETIO_CORS_ORIGINS must be a JSON array, e.g. "
+                    '["http://localhost:3000"] or []'
+                )
+            if not all(isinstance(item, str) for item in parsed):
+                raise ValueError("SOCKETIO_CORS_ORIGINS must contain only string origins")
+            return parsed
         if isinstance(v, list):
             return v
         return ["*"]
