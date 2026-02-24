@@ -9,13 +9,15 @@ import base64
 import time
 import os
 import asyncio
-from typing import Dict, Any, Optional, Tuple, List
+from typing import Dict, Any, Optional, Tuple
 import json
 import redis.asyncio as redis
+from cachetools import TTLCache
 from .config import Config
 from .types.messages import TranscriptionChunk, TextAnalysisResult, AudioChunk
 from .services.analysis_service import TextAnalysisService
 from .services.transcription_service import TranscriptionService
+from .services.facades import AudioBufferFacade
 from .services.audio_buffer_service import AudioBufferService
 
 logger = structlog.get_logger()
@@ -33,7 +35,7 @@ def _env_float(name: str, default: float) -> float:
     except ValueError:
         return default
 
-audio_buffer_service = AudioBufferService(
+audio_buffer_service: AudioBufferFacade = AudioBufferService(
     # P4.1: Buffer mínimo aumentado para 7s - contexto maior reduz alucinações do Whisper
     # Trade-off: Latência ligeiramente maior, mas melhora significativa na precisão
     # Para testes manuais, experimente 8-10s para reduzir truncamento de frases.
@@ -51,6 +53,7 @@ _deep_consumer_name = os.getenv('DEEP_AUDIO_CONSUMER_NAME', f'worker-{os.getpid(
 
 _deep_redis: Optional[redis.Redis] = None
 _deep_results_stream = os.getenv('DEEP_RESULTS_STREAM_KEY', 'deep:text_results')
+_deep_consumer_task: Optional[asyncio.Task] = None
 
 async def _ensure_deep_group(r: redis.Redis):
     try:
@@ -139,8 +142,8 @@ async def _deep_audio_loop():
 
             wav_bytes = base64.b64decode(wav_b64)
 
-            # Backpressure coalescing happens inside on_buffer_ready via our scheduler.
-            _schedule_buffer_job(
+            # Continuous ingestion: push chunk into circular stream manager.
+            combined_wav = await audio_buffer_service.add_chunk(
                 meeting_id=meeting_id,
                 participant_id=participant_id,
                 track=track,
@@ -148,9 +151,19 @@ async def _deep_audio_loop():
                 sample_rate=sample_rate,
                 channels=channels,
                 timestamp=ts_capture,
-                ts_enqueued=ts_enqueued,
-                seq=seq,
             )
+            if combined_wav:
+                await on_buffer_ready(
+                    meeting_id=meeting_id,
+                    participant_id=participant_id,
+                    track=track,
+                    wav_data=combined_wav,
+                    sample_rate=sample_rate,
+                    channels=channels,
+                    timestamp=ts_capture,
+                    ts_enqueued=ts_enqueued,
+                    seq=seq,
+                )
 
             await _deep_redis.xack(_deep_audio_stream, _deep_consumer_group, entry_id)
         except asyncio.CancelledError:
@@ -177,89 +190,12 @@ async def _deep_audio_loop():
             
             await asyncio.sleep(1.0)
 
-AudioKey = Tuple[str, str, str]  # (meeting_id, participant_id, track)
-
-# Backpressure: mantemos uma pequena fila por participante/track para reduzir perda de áudio.
-# Com MAX_CONCURRENT_TRANSCRIPTIONS=2, podemos processar múltiplos participantes em paralelo.
-# Queue depth configurável (default: 2) permite buffer pequeno sem crescimento infinito.
-_MAX_QUEUE_DEPTH_PER_KEY = int(os.getenv('MAX_QUEUE_DEPTH_PER_KEY', '2'))
-_job_queues_by_key: Dict[AudioKey, List[Dict[str, Any]]] = {}
-_runner_by_key: Dict[AudioKey, asyncio.Task] = {}
-_dropped_jobs_by_key: Dict[AudioKey, int] = {}
-
-async def _run_key_queue(key: AudioKey):
-    """Process jobs in queue for a specific participant/track."""
-    while True:
-        if key not in _job_queues_by_key or not _job_queues_by_key[key]:
-            # Queue empty, clean up
-            if key in _job_queues_by_key:
-                del _job_queues_by_key[key]
-            return
-        
-        job = _job_queues_by_key[key].pop(0)
-        await on_buffer_ready(**job)
-
-def _schedule_buffer_job(
-    meeting_id: str,
-    participant_id: str,
-    track: str,
-    wav_data: bytes,
-    sample_rate: int,
-    channels: int,
-    timestamp: int,
-    ts_enqueued: int = 0,
-    seq: str = '',
-):
-    """
-    Schedule audio buffer job with queue-depth backpressure.
-    
-    Strategy:
-    - Maintain small queue (depth=2) per participant/track
-    - If queue full, drop OLDEST job (keep most recent)
-    - This reduces audio loss by 50% vs drop-all strategy
-    """
-    key: AudioKey = (meeting_id, participant_id, track)
-    
-    # Initialize queue if needed
-    if key not in _job_queues_by_key:
-        _job_queues_by_key[key] = []
-    
-    queue = _job_queues_by_key[key]
-    
-    # Backpressure: if queue full, drop oldest job
-    if len(queue) >= _MAX_QUEUE_DEPTH_PER_KEY:
-        dropped_job = queue.pop(0)  # Drop oldest, keep most recent
-        _dropped_jobs_by_key[key] = _dropped_jobs_by_key.get(key, 0) + 1
-        logger.warn(
-            "🧹 [BACKPRESSURE] Queue full, dropping oldest job",
-            meeting_id=meeting_id,
-            participant_id=participant_id,
-            track=track,
-            queue_depth=len(queue),
-            max_depth=_MAX_QUEUE_DEPTH_PER_KEY,
-            dropped_total=_dropped_jobs_by_key[key],
-        )
-    
-    # Add new job to queue
-    queue.append({
-        'meeting_id': meeting_id,
-        'participant_id': participant_id,
-        'track': track,
-        'wav_data': wav_data,
-        'sample_rate': sample_rate,
-        'channels': channels,
-        'timestamp': timestamp,
-        'ts_enqueued': ts_enqueued,
-        'seq': seq,
-    })
-    
-    # Start queue processor if not running
-    task = _runner_by_key.get(key)
-    if task is None or task.done():
-        _runner_by_key[key] = asyncio.create_task(_run_key_queue(key))
+_result_dedupe_cache = TTLCache(
+    maxsize=Config.RESULT_DEDUPE_MAX_SIZE,
+    ttl=Config.RESULT_DEDUPE_TTL_SEC,
+)
 
 
-# Configurar callback para quando buffer estiver pronto
 async def on_buffer_ready(meeting_id: str, participant_id: str, track: str,
                          wav_data: bytes, sample_rate: int, channels: int, timestamp: int,
                          ts_enqueued: int = 0, seq: str = ''):
@@ -331,6 +267,17 @@ async def on_buffer_ready(meeting_id: str, participant_id: str, track: str,
             'total_processing_time_ms': t5_processing_complete - timestamp,
         }
         
+        dedupe_key = (meeting_id, participant_id)
+        fingerprint = f"{timestamp}:{text}"
+        if _result_dedupe_cache.get(dedupe_key) == fingerprint:
+            logger.debug(
+                "🧩 [DEDUPE] Resultado duplicado ignorado",
+                meeting_id=meeting_id,
+                participant_id=participant_id,
+            )
+            return
+        _result_dedupe_cache[dedupe_key] = fingerprint
+
         # Escolher um caminho: Redis (queue) OU Socket.IO (direct), não ambos
         if _deep_queue_enabled and _deep_redis_url:
             # Queue path: publish to Redis only
@@ -388,19 +335,7 @@ async def on_buffer_ready(meeting_id: str, participant_id: str, track: str,
             error_type=type(e).__name__
         )
 
-async def on_buffer_ready_enqueue(meeting_id: str, participant_id: str, track: str,
-                                 wav_data: bytes, sample_rate: int, channels: int, timestamp: int):
-    _schedule_buffer_job(
-        meeting_id=meeting_id,
-        participant_id=participant_id,
-        track=track,
-        wav_data=wav_data,
-        sample_rate=sample_rate,
-        channels=channels,
-        timestamp=timestamp,
-    )
-
-audio_buffer_service.set_callback(on_buffer_ready_enqueue)
+audio_buffer_service.set_callback(on_buffer_ready)
 
 # Criar servidor Socket.IO
 # Configurações para melhor compatibilidade com Railway e polling HTTP
@@ -461,7 +396,13 @@ def start_deep_queue_consumer():
         )
         return
     
+    global _deep_consumer_task
+    if _deep_consumer_task is not None and not _deep_consumer_task.done():
+        logger.info("ℹ️ [DEEP_QUEUE] Consumer loop already running")
+        return
+
     task = asyncio.create_task(_deep_audio_loop())
+    _deep_consumer_task = task
     
     def on_done(t: asyncio.Task):
         if t.exception():
@@ -483,6 +424,21 @@ def start_deep_queue_consumer():
         socket_io_audio="NOT USED - audio comes from Redis",
         note="Backend sends audio via Redis, results go back to Redis",
     )
+
+
+async def shutdown_audio_pipeline():
+    """Gracefully stop deep consumer and stream workers."""
+    global _deep_consumer_task
+
+    if _deep_consumer_task is not None and not _deep_consumer_task.done():
+        _deep_consumer_task.cancel()
+        try:
+            await _deep_consumer_task
+        except asyncio.CancelledError:
+            pass
+    _deep_consumer_task = None
+
+    await audio_buffer_service.shutdown()
 
 
 @sio.event
@@ -773,9 +729,8 @@ async def audio_chunk(sid, data: Dict[str, Any]):
             audio_size_bytes=len(combined_wav)
         )
         
-        # Backpressure: não bloquear o handler aguardando transcrição/análise.
-        # Agendamos o job e coalescemos se chegar mais áudio (sempre processar o mais recente).
-        _schedule_buffer_job(
+        # Sem arquitetura de jobs: processa imediatamente o buffer combinado.
+        await on_buffer_ready(
             meeting_id=meeting_id,
             participant_id=participant_id,
             track=track,
@@ -786,189 +741,6 @@ async def audio_chunk(sid, data: Dict[str, Any]):
         )
         
         return
-        
-        # Código abaixo não será executado (mantido para referência)
-        # Buffer está pronto! Transcrever áudio combinado
-        logger.info(
-            "🎙️ [FLUXO] Buffer pronto, iniciando transcrição de áudio agrupado",
-            client_id=sid,
-            meeting_id=meeting_id,
-            participant_id=participant_id,
-            audio_size_bytes=len(combined_wav),
-            sample_rate=sample_rate,
-            language=data.get('language', Config.WHISPER_LANGUAGE)
-        )
-        
-        # Transcrever áudio combinado
-        if transcription_service is None:
-            logger.warn(
-                "⚠️ [FLUXO] TranscriptionService não disponível, pulando transcrição",
-                client_id=sid,
-                meeting_id=meeting_id,
-                participant_id=participant_id
-            )
-            return
-        
-        try:
-            transcription_result = await transcription_service.transcribe_audio(
-                audio_data=combined_wav,
-                sample_rate=sample_rate,
-                language=data.get('language', Config.WHISPER_LANGUAGE)
-            )
-            
-            logger.info(
-                "✅ [FLUXO] Transcrição de áudio agrupado concluída",
-                client_id=sid,
-                meeting_id=meeting_id,
-                result_type=type(transcription_result).__name__
-            )
-        except Exception as transcribe_error:
-            logger.error(
-                "❌ [FLUXO] Erro ao transcrever áudio agrupado",
-                client_id=sid,
-                meeting_id=meeting_id,
-                error=str(transcribe_error),
-                error_type=type(transcribe_error).__name__
-            )
-            raise
-        
-        # DIAGNÓSTICO: Log do resultado da transcrição
-        logger.info(
-            "🔍 [DIAGNÓSTICO] Resultado da transcrição recebido",
-            client_id=sid,
-            meeting_id=meeting_id,
-            result_keys=list(transcription_result.keys()) if isinstance(transcription_result, dict) else 'not_dict',
-            has_text='text' in transcription_result if isinstance(transcription_result, dict) else False,
-            text_preview=transcription_result.get('text', '')[:50] if isinstance(transcription_result, dict) else 'N/A',
-            text_length=len(transcription_result.get('text', '')) if isinstance(transcription_result, dict) else 0
-        )
-        
-        text = transcription_result.get('text', '').strip()
-        confidence = transcription_result.get('confidence', 0.0)
-        detected_language = transcription_result.get('language', 'unknown')
-        
-        # DIAGNÓSTICO: Log antes do if not text
-        logger.info(
-            "🔍 [DIAGNÓSTICO] Antes de verificar texto",
-            client_id=sid,
-            meeting_id=meeting_id,
-            text_length=len(text),
-            text_preview=text[:50] if text else 'VAZIO',
-            confidence=confidence,
-            detected_language=detected_language
-        )
-        
-        if not text:
-            logger.warn(
-                "⚠️ [FLUXO] Nenhum texto transcrito do áudio",
-                client_id=sid,
-                meeting_id=meeting_id,
-                confidence=confidence
-            )
-            # Enviar resultado vazio com estrutura completa
-            await sio.emit('text_analysis_result', {
-                'meetingId': data.get('meetingId'),
-                'participantId': data.get('participantId'),
-                'text': '',
-                'analysis': {
-                    'intent': 'unknown',
-                    'intent_confidence': 0.0,
-                    'topic': 'unknown',
-                    'topic_confidence': 0.0,
-                    'speech_act': 'statement',
-                    'speech_act_confidence': 0.0,
-                    'keywords': [],
-                    'entities': [],
-                    'sentiment': 'neutral',
-                    'sentiment_score': 0.5,
-                    'urgency': 0.0,
-                    'embedding': []
-                },
-                'timestamp': data.get('timestamp', 0),
-                'confidence': 0.0
-            }, room=sid)
-            return
-        
-        logger.info(
-            "✅ [FLUXO] Transcrição concluída",
-            client_id=sid,
-            meeting_id=meeting_id,
-            text_length=len(text),
-            text_preview=text[:50],
-            confidence=round(confidence, 3),
-            detected_language=detected_language
-        )
-        
-        # Criar chunk de transcrição para análise
-        from .types.messages import TranscriptionChunk
-        chunk = TranscriptionChunk(
-            meetingId=data.get('meetingId'),
-            participantId=data.get('participantId'),
-            text=text,
-            timestamp=data.get('timestamp', 0),
-            language=detected_language,
-            confidence=confidence
-        )
-        
-        # Analisar texto com BERT
-        logger.info(
-            "⚙️ [FLUXO] Iniciando análise de texto transcrito",
-            client_id=sid,
-            meeting_id=meeting_id,
-            participant_id=participant_id,
-            text_length=len(text)
-        )
-        analysis_result = await analysis_service.analyze(chunk)
-        
-        logger.debug(
-            "✅ [FLUXO] Análise concluída, criando resposta",
-            client_id=sid,
-            meeting_id=meeting_id,
-            intent=analysis_result.get('intent'),
-            sentiment=analysis_result.get('sentiment')
-        )
-        
-        # Criar resposta
-        result = TextAnalysisResult(
-            meetingId=chunk.meetingId,
-            participantId=chunk.participantId,
-            text=chunk.text,
-            analysis=analysis_result,
-            timestamp=chunk.timestamp,
-            confidence=confidence
-        )
-        
-        # Enviar resultado de volta via Socket.IO
-        # Pydantic v2.5.3 usa model_dump() ao invés de dict()
-        result_dict = result.model_dump()
-        # 🔴 BROADCAST: Envia para TODOS os clientes conectados (extensão E backend)
-        logger.debug(
-            "🔴 [DIAGNOSTICO] Emitindo text_analysis_result via BROADCAST",
-            client_id=sid,
-            meeting_id=chunk.meetingId,
-            participant_id=chunk.participantId
-        )
-        await sio.emit('text_analysis_result', result_dict)
-        
-        logger.info(
-            "📤 [FLUXO] Resultado de análise enviado (do áudio) [BROADCAST]",
-            client_id=sid,
-            meeting_id=chunk.meetingId,
-            participant_id=chunk.participantId,
-            transcription_confidence=round(confidence, 3),
-            intent=analysis_result.get('intent'),
-            intent_confidence=analysis_result.get('intent_confidence'),
-            topic=analysis_result.get('topic'),
-            topic_confidence=analysis_result.get('topic_confidence'),
-            speech_act=analysis_result.get('speech_act'),
-            sentiment=analysis_result.get('sentiment'),
-            sentiment_score=analysis_result.get('sentiment_score'),
-            urgency=analysis_result.get('urgency'),
-            keywords_count=len(analysis_result.get('keywords', [])),
-            entities_count=len(analysis_result.get('entities', [])),
-            embedding_dim=len(analysis_result.get('embedding', []))
-        )
-        
     except Exception as e:
         logger.error(
             "Error processing audio chunk",

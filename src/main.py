@@ -93,7 +93,11 @@ async def lifespan(app: FastAPI):
     """
     # Startup
     logger.info("🚀 [STARTUP] Initializing services...")
-    from .socketio_server import start_deep_queue_consumer, transcription_service
+    from .socketio_server import (
+        start_deep_queue_consumer,
+        shutdown_audio_pipeline,
+        transcription_service,
+    )
     
     # Pre-load faster-whisper model during startup to eliminate first-transcription delay
     if transcription_service:
@@ -107,7 +111,8 @@ async def lifespan(app: FastAPI):
     
     yield
     
-    # Shutdown (if needed in future)
+    # Shutdown
+    await shutdown_audio_pipeline()
     logger.info("🛑 [SHUTDOWN] Shutting down...")
 
 # Criar app FastAPI com lifespan
