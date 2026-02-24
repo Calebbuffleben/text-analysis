@@ -268,7 +268,7 @@ async def on_buffer_ready(meeting_id: str, participant_id: str, track: str,
         }
         
         dedupe_key = (meeting_id, participant_id)
-        fingerprint = f"{timestamp}:{text}"
+        fingerprint = text
         if _result_dedupe_cache.get(dedupe_key) == fingerprint:
             logger.debug(
                 "🧩 [DEDUPE] Resultado duplicado ignorado",
