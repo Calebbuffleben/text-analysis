@@ -322,8 +322,8 @@ if __name__ == "__main__":
     
     uvicorn.run(
         fastapi_app,
-        host=Config.HOST,
-        port=Config.PORT,
+        host="0.0.0.0",
+        port=int(os.getenv('PORT', 8000)),
         log_level=Config.LOG_LEVEL.lower(),
         access_log=False,  # Usar structlog ao invés
         use_colors=False,  # Desabilitar cores no Docker
