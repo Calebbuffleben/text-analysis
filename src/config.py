@@ -1,62 +1,144 @@
-import os
-from dotenv import load_dotenv
+import json
+from typing import Any, List
 
-load_dotenv()
+from pydantic import Field, ValidationError, field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class _Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    # Server Configuration
+    PORT: int = 8000
+    HOST: str = "0.0.0.0"
+    PUBLIC_HOSTNAME: str = "backend-analysis-production-a688.up.railway.app"
+    LOG_LEVEL: str = "INFO"
+
+    # Socket.IO Configuration
+    SOCKETIO_CORS_ORIGINS: str | List[str] | None = Field(default="*")
+
+    # ML Model Configuration
+    MODEL_NAME: str = "neuralmind/bert-base-portuguese-cased"
+    MODEL_CACHE_DIR: str = "/app/models/.cache"
+    MODEL_DEVICE: str = "cpu"
+
+    # SBERT Configuration
+    SBERT_MODEL_NAME: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+
+    # Cache Configuration
+    CACHE_TTL_SECONDS: int = 300
+    CACHE_MAX_SIZE: int = 1000
+
+    # Performance Configuration
+    ANALYSIS_MAX_LENGTH: int = 512
+    ANALYSIS_BATCH_SIZE: int = 1
+
+    # Whisper Configuration
+    WHISPER_MODEL_NAME: str = "tiny"
+    WHISPER_DEVICE: str = "cpu"
+    WHISPER_LANGUAGE: str = "pt"
+    WHISPER_TASK: str = "transcribe"
+
+    # Transcription Concurrency
+    MAX_CONCURRENT_TRANSCRIPTIONS: int = 2
+
+    # Continuous worker architecture flags
+    CONTINUOUS_WORKER_ENABLED: bool = False
+    CONTINUOUS_RING_CAPACITY_SEC: float = 20.0
+    CONTINUOUS_WINDOW_SEC: float = 5.0
+    CONTINUOUS_HOP_SEC: float = 1.0
+    CONTINUOUS_TICK_SEC: float = 1.0
+
+    # Dedupe configuration
+    RESULT_DEDUPE_TTL_SEC: float = 6.0
+    RESULT_DEDUPE_MAX_SIZE: int = 20000
+
+    @field_validator("SOCKETIO_CORS_ORIGINS", mode="before")
+    @classmethod
+    def _split_cors_origins(cls, v: Any) -> List[str]:
+        # Robust env normalization for deployment-safe parsing.
+        # Supports:
+        # - JSON array: ["https://a.com","https://b.com"]
+        # - single value: https://example.com
+        # - comma-separated: https://a.com,https://b.com
+        # - wildcard: *
+        # - empty/undefined: defaults to ["*"]
+        default = ["*"]
+
+        if v is None:
+            return default
+
+        if isinstance(v, list):
+            normalized = [str(item).strip() for item in v if str(item).strip()]
+            return normalized or default
+
+        if isinstance(v, str):
+            raw = v.strip()
+            if raw == "":
+                return default
+            if raw == "*":
+                return default
+
+            # JSON list input (preferred in strict env setups)
+            if raw.startswith("["):
+                try:
+                    parsed = json.loads(raw)
+                    if isinstance(parsed, list):
+                        normalized = [str(item).strip() for item in parsed if str(item).strip()]
+                        return normalized or default
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    # Fall through to string parsing fallback
+                    pass
+
+            # Comma-separated or single value
+            parts = [part.strip() for part in raw.split(",") if part.strip()]
+            return parts or default
+
+        return default
+
+
+_settings = _Settings()
+
 
 class Config:
     """
-    Configurações centralizadas do serviço de análise de texto.
-    Todas as configurações são carregadas de variáveis de ambiente
-    com valores padrão sensatos.
+    Compat layer to preserve Config.X access pattern.
+    Values are now loaded and validated via pydantic-settings.
     """
-    
-    # Server Configuration
-    PORT: int = int(os.getenv('PORT', '8000'))
-    # Bind host: always use 0.0.0.0 in containers to listen on all interfaces
-    # Railway sets HOST with an IP for routing, but we need 0.0.0.0 for bind
-    # The public hostname is still backend-analysis-production-a688.up.railway.app
-    HOST: str = '0.0.0.0'  # Required for Docker/Railway containers
-    # Public hostname for external access (used in logs/references)
-    PUBLIC_HOSTNAME: str = os.getenv('PUBLIC_HOSTNAME', 'backend-analysis-production-a688.up.railway.app')
-    LOG_LEVEL: str = os.getenv('LOG_LEVEL', 'INFO')
-    
-    # Socket.IO Configuration
-    SOCKETIO_CORS_ORIGINS: list = os.getenv('SOCKETIO_CORS_ORIGINS', '*').split(',')
-    
-    # ML Model Configuration
-    MODEL_NAME: str = os.getenv('MODEL_NAME', 'neuralmind/bert-base-portuguese-cased')
-    MODEL_CACHE_DIR: str = os.getenv('MODEL_CACHE_DIR', '/app/models/.cache')
-    MODEL_DEVICE: str = os.getenv('MODEL_DEVICE', 'cpu')
-    
-    # SBERT Configuration (para análise semântica)
-    SBERT_MODEL_NAME: str = os.getenv('SBERT_MODEL_NAME', 'sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2')
-    
-    # Cache Configuration
-    CACHE_TTL_SECONDS: int = int(os.getenv('CACHE_TTL_SECONDS', '300'))
-    CACHE_MAX_SIZE: int = int(os.getenv('CACHE_MAX_SIZE', '1000'))
-    
-    # Performance Configuration
-    ANALYSIS_MAX_LENGTH: int = int(os.getenv('ANALYSIS_MAX_LENGTH', '512'))
-    ANALYSIS_BATCH_SIZE: int = int(os.getenv('ANALYSIS_BATCH_SIZE', '1'))
-    
-    # Whisper Configuration (para transcrição de áudio)
-    # IMPORTANTE: O default é 'tiny' para melhor performance
-    # Se WHISPER_MODEL_NAME não estiver definido, usa 'tiny'
-    _whisper_model_env = os.getenv('WHISPER_MODEL_NAME')
-    WHISPER_MODEL_NAME: str = _whisper_model_env if _whisper_model_env is not None else 'tiny'
-    WHISPER_DEVICE: str = os.getenv('WHISPER_DEVICE', 'cpu')
-    WHISPER_LANGUAGE: str = os.getenv('WHISPER_LANGUAGE', 'pt')
-    WHISPER_TASK: str = os.getenv('WHISPER_TASK', 'transcribe')
-    
-    # Transcription Concurrency Configuration
-    # Number of concurrent transcriptions allowed (default: 2)
-    # Higher values allow processing multiple participants in parallel
-    # but consume more CPU/memory
-    MAX_CONCURRENT_TRANSCRIPTIONS: int = int(os.getenv('MAX_CONCURRENT_TRANSCRIPTIONS', '2'))
-    
+
+    PORT = _settings.PORT
+    HOST = _settings.HOST
+    PUBLIC_HOSTNAME = _settings.PUBLIC_HOSTNAME
+    LOG_LEVEL = _settings.LOG_LEVEL
+    SOCKETIO_CORS_ORIGINS = _settings.SOCKETIO_CORS_ORIGINS
+    MODEL_NAME = _settings.MODEL_NAME
+    MODEL_CACHE_DIR = _settings.MODEL_CACHE_DIR
+    MODEL_DEVICE = _settings.MODEL_DEVICE
+    SBERT_MODEL_NAME = _settings.SBERT_MODEL_NAME
+    CACHE_TTL_SECONDS = _settings.CACHE_TTL_SECONDS
+    CACHE_MAX_SIZE = _settings.CACHE_MAX_SIZE
+    ANALYSIS_MAX_LENGTH = _settings.ANALYSIS_MAX_LENGTH
+    ANALYSIS_BATCH_SIZE = _settings.ANALYSIS_BATCH_SIZE
+    WHISPER_MODEL_NAME = _settings.WHISPER_MODEL_NAME
+    WHISPER_DEVICE = _settings.WHISPER_DEVICE
+    WHISPER_LANGUAGE = _settings.WHISPER_LANGUAGE
+    WHISPER_TASK = _settings.WHISPER_TASK
+    MAX_CONCURRENT_TRANSCRIPTIONS = _settings.MAX_CONCURRENT_TRANSCRIPTIONS
+    CONTINUOUS_WORKER_ENABLED = _settings.CONTINUOUS_WORKER_ENABLED
+    CONTINUOUS_RING_CAPACITY_SEC = _settings.CONTINUOUS_RING_CAPACITY_SEC
+    CONTINUOUS_WINDOW_SEC = _settings.CONTINUOUS_WINDOW_SEC
+    CONTINUOUS_HOP_SEC = _settings.CONTINUOUS_HOP_SEC
+    CONTINUOUS_TICK_SEC = _settings.CONTINUOUS_TICK_SEC
+    RESULT_DEDUPE_TTL_SEC = _settings.RESULT_DEDUPE_TTL_SEC
+    RESULT_DEDUPE_MAX_SIZE = _settings.RESULT_DEDUPE_MAX_SIZE
+
     @classmethod
     def validate(cls):
-        """Valida configurações críticas"""
+        """Validate critical config constraints."""
+        try:
+            _Settings()
+        except ValidationError as exc:
+            raise AssertionError(f"Invalid configuration: {exc}") from exc
         assert cls.MODEL_NAME, "MODEL_NAME must be set"
         assert cls.MODEL_CACHE_DIR, "MODEL_CACHE_DIR must be set"
         assert cls.CACHE_TTL_SECONDS > 0, "CACHE_TTL_SECONDS must be positive"

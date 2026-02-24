@@ -93,7 +93,11 @@ async def lifespan(app: FastAPI):
     """
     # Startup
     logger.info("🚀 [STARTUP] Initializing services...")
-    from .socketio_server import start_deep_queue_consumer, transcription_service
+    from .socketio_server import (
+        start_deep_queue_consumer,
+        shutdown_audio_pipeline,
+        transcription_service,
+    )
     
     # Pre-load faster-whisper model during startup to eliminate first-transcription delay
     if transcription_service:
@@ -107,7 +111,8 @@ async def lifespan(app: FastAPI):
     
     yield
     
-    # Shutdown (if needed in future)
+    # Shutdown
+    await shutdown_audio_pipeline()
     logger.info("🛑 [SHUTDOWN] Shutting down...")
 
 # Criar app FastAPI com lifespan
@@ -317,8 +322,8 @@ if __name__ == "__main__":
     
     uvicorn.run(
         fastapi_app,
-        host=Config.HOST,
-        port=Config.PORT,
+        host="0.0.0.0",
+        port=int(os.getenv('PORT', 8000)),
         log_level=Config.LOG_LEVEL.lower(),
         access_log=False,  # Usar structlog ao invés
         use_colors=False,  # Desabilitar cores no Docker
