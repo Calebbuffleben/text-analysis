@@ -1,3 +1,4 @@
+import json
 from typing import Any, List
 
 from pydantic import Field, ValidationError, field_validator
@@ -14,7 +15,7 @@ class _Settings(BaseSettings):
     LOG_LEVEL: str = "INFO"
 
     # Socket.IO Configuration
-    SOCKETIO_CORS_ORIGINS: List[str] = Field(default_factory=lambda: ["*"])
+    SOCKETIO_CORS_ORIGINS: str | List[str] | None = Field(default="*")
 
     # ML Model Configuration
     MODEL_NAME: str = "neuralmind/bert-base-portuguese-cased"
@@ -55,11 +56,45 @@ class _Settings(BaseSettings):
     @field_validator("SOCKETIO_CORS_ORIGINS", mode="before")
     @classmethod
     def _split_cors_origins(cls, v: Any) -> List[str]:
-        # Native pydantic-settings parsing handles JSON env values for List[str].
-        # Keep only lightweight normalization for direct list assignments.
+        # Robust env normalization for deployment-safe parsing.
+        # Supports:
+        # - JSON array: ["https://a.com","https://b.com"]
+        # - single value: https://example.com
+        # - comma-separated: https://a.com,https://b.com
+        # - wildcard: *
+        # - empty/undefined: defaults to ["*"]
+        default = ["*"]
+
+        if v is None:
+            return default
+
         if isinstance(v, list):
-            return [str(item).strip() for item in v if str(item).strip()]
-        return v
+            normalized = [str(item).strip() for item in v if str(item).strip()]
+            return normalized or default
+
+        if isinstance(v, str):
+            raw = v.strip()
+            if raw == "":
+                return default
+            if raw == "*":
+                return default
+
+            # JSON list input (preferred in strict env setups)
+            if raw.startswith("["):
+                try:
+                    parsed = json.loads(raw)
+                    if isinstance(parsed, list):
+                        normalized = [str(item).strip() for item in parsed if str(item).strip()]
+                        return normalized or default
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    # Fall through to string parsing fallback
+                    pass
+
+            # Comma-separated or single value
+            parts = [part.strip() for part in raw.split(",") if part.strip()]
+            return parts or default
+
+        return default
 
 
 _settings = _Settings()
