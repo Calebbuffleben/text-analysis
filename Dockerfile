@@ -18,6 +18,7 @@ RUN apt-get update && apt-get install -y \
     libffi-dev \
     libssl-dev \
     pkg-config \
+    libsndfile1 \
     && rm -rf /var/lib/apt/lists/*
 
 # Diretório de trabalho

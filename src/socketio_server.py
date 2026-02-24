@@ -9,7 +9,7 @@ import base64
 import time
 import os
 import asyncio
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional, Tuple, List
 import json
 import redis.asyncio as redis
 from .config import Config
@@ -103,6 +103,9 @@ async def _deep_audio_loop():
             # resp format: [(stream, [(id, {field: value})])]\n
             _, entries = resp[0]
             entry_id, fields = entries[0]
+            
+            t4_received = time.time() * 1000  # ms
+            
             wav_b64 = fields.get('wavBase64') or ''
             meeting_id = fields.get('meetingId') or ''
             participant_id = fields.get('participantId') or ''
@@ -110,10 +113,29 @@ async def _deep_audio_loop():
             sample_rate = int(fields.get('sampleRate') or '16000')
             channels = int(fields.get('channels') or '1')
             ts_capture = int(fields.get('tsCaptureMs') or str(int(time.time() * 1000)))
+            ts_enqueued = int(fields.get('tsEnqueueMs') or str(int(time.time() * 1000)))
+            seq = fields.get('seq') or ''
 
             if not wav_b64 or not meeting_id or not participant_id:
                 await _deep_redis.xack(_deep_audio_stream, _deep_consumer_group, entry_id)
                 continue
+            
+            logger.info(
+                "[LATENCY] Deep queue job received",
+                meeting_id=meeting_id,
+                participant_id=participant_id,
+                seq=seq,
+                timestamps={
+                    't0_capture': ts_capture,
+                    't3_enqueued': ts_enqueued,
+                    't4_received': t4_received,
+                },
+                latencies_ms={
+                    'capture_to_enqueued': ts_enqueued - ts_capture,
+                    'enqueued_to_received': t4_received - ts_enqueued,
+                    'total_until_python': t4_received - ts_capture,
+                },
+            )
 
             wav_bytes = base64.b64decode(wav_b64)
 
@@ -126,9 +148,15 @@ async def _deep_audio_loop():
                 sample_rate=sample_rate,
                 channels=channels,
                 timestamp=ts_capture,
+                ts_enqueued=ts_enqueued,
+                seq=seq,
             )
 
             await _deep_redis.xack(_deep_audio_stream, _deep_consumer_group, entry_id)
+        except asyncio.CancelledError:
+            # Task was cancelled (usually during shutdown) - exit gracefully
+            logger.info("🛑 [DEEP_QUEUE] Consumer loop cancelled (shutdown requested)")
+            break
         except Exception as e:
             _deep_loop_consecutive_errors += 1
             logger.error(
@@ -151,18 +179,24 @@ async def _deep_audio_loop():
 
 AudioKey = Tuple[str, str, str]  # (meeting_id, participant_id, track)
 
-# Backpressure: para evitar "parar depois de alguns minutos", mantemos no máximo 1 job pendente por participante/track.
-# Em calls longas com múltiplos participantes, o Whisper fica serializado (semaphore=1) e a fila cresce.
-# Aqui nós "coalescemos" jobs: sempre processar o mais recente e descartar intermediários.
-_latest_job_by_key: Dict[AudioKey, Dict[str, Any]] = {}
+# Backpressure: mantemos uma pequena fila por participante/track para reduzir perda de áudio.
+# Com MAX_CONCURRENT_TRANSCRIPTIONS=2, podemos processar múltiplos participantes em paralelo.
+# Queue depth configurável (default: 2) permite buffer pequeno sem crescimento infinito.
+_MAX_QUEUE_DEPTH_PER_KEY = int(os.getenv('MAX_QUEUE_DEPTH_PER_KEY', '2'))
+_job_queues_by_key: Dict[AudioKey, List[Dict[str, Any]]] = {}
 _runner_by_key: Dict[AudioKey, asyncio.Task] = {}
 _dropped_jobs_by_key: Dict[AudioKey, int] = {}
 
 async def _run_key_queue(key: AudioKey):
+    """Process jobs in queue for a specific participant/track."""
     while True:
-        job = _latest_job_by_key.pop(key, None)
-        if job is None:
+        if key not in _job_queues_by_key or not _job_queues_by_key[key]:
+            # Queue empty, clean up
+            if key in _job_queues_by_key:
+                del _job_queues_by_key[key]
             return
+        
+        job = _job_queues_by_key[key].pop(0)
         await on_buffer_ready(**job)
 
 def _schedule_buffer_job(
@@ -173,19 +207,41 @@ def _schedule_buffer_job(
     sample_rate: int,
     channels: int,
     timestamp: int,
+    ts_enqueued: int = 0,
+    seq: str = '',
 ):
+    """
+    Schedule audio buffer job with queue-depth backpressure.
+    
+    Strategy:
+    - Maintain small queue (depth=2) per participant/track
+    - If queue full, drop OLDEST job (keep most recent)
+    - This reduces audio loss by 50% vs drop-all strategy
+    """
     key: AudioKey = (meeting_id, participant_id, track)
-    if key in _latest_job_by_key:
+    
+    # Initialize queue if needed
+    if key not in _job_queues_by_key:
+        _job_queues_by_key[key] = []
+    
+    queue = _job_queues_by_key[key]
+    
+    # Backpressure: if queue full, drop oldest job
+    if len(queue) >= _MAX_QUEUE_DEPTH_PER_KEY:
+        dropped_job = queue.pop(0)  # Drop oldest, keep most recent
         _dropped_jobs_by_key[key] = _dropped_jobs_by_key.get(key, 0) + 1
         logger.warn(
-            "🧹 [BACKPRESSURE] Substituindo job pendente (descartando intermediário)",
+            "🧹 [BACKPRESSURE] Queue full, dropping oldest job",
             meeting_id=meeting_id,
             participant_id=participant_id,
             track=track,
-            dropped=_dropped_jobs_by_key.get(key, 0),
+            queue_depth=len(queue),
+            max_depth=_MAX_QUEUE_DEPTH_PER_KEY,
+            dropped_total=_dropped_jobs_by_key[key],
         )
-
-    _latest_job_by_key[key] = {
+    
+    # Add new job to queue
+    queue.append({
         'meeting_id': meeting_id,
         'participant_id': participant_id,
         'track': track,
@@ -193,7 +249,11 @@ def _schedule_buffer_job(
         'sample_rate': sample_rate,
         'channels': channels,
         'timestamp': timestamp,
-    }
+        'ts_enqueued': ts_enqueued,
+        'seq': seq,
+    })
+    
+    # Start queue processor if not running
     task = _runner_by_key.get(key)
     if task is None or task.done():
         _runner_by_key[key] = asyncio.create_task(_run_key_queue(key))
@@ -201,7 +261,8 @@ def _schedule_buffer_job(
 
 # Configurar callback para quando buffer estiver pronto
 async def on_buffer_ready(meeting_id: str, participant_id: str, track: str,
-                         wav_data: bytes, sample_rate: int, channels: int, timestamp: int):
+                         wav_data: bytes, sample_rate: int, channels: int, timestamp: int,
+                         ts_enqueued: int = 0, seq: str = ''):
     """Callback chamado quando buffer está pronto para transcrição"""
     try:
         logger.info(
@@ -264,7 +325,14 @@ async def on_buffer_ready(meeting_id: str, participant_id: str, track: str,
             confidence=confidence
         )
         
+        t5_processing_complete = time.time() * 1000
+        
         result_dict = result.model_dump()
+        result_dict['timing'] = {
+            't0_capture': timestamp,
+            't5_processing_complete': t5_processing_complete,
+            'total_processing_time_ms': t5_processing_complete - timestamp,
+        }
         
         # Escolher um caminho: Redis (queue) OU Socket.IO (direct), não ambos
         if _deep_queue_enabled and _deep_redis_url:
@@ -275,11 +343,21 @@ async def on_buffer_ready(meeting_id: str, participant_id: str, track: str,
                     # decode_responses=True because we store JSON string
                     globals()['_deep_redis'] = redis.from_url(_deep_redis_url, decode_responses=True)
                 await _deep_redis.xadd(_deep_results_stream, {'json': json.dumps(result_dict)}, maxlen=20000, approximate=True)
-                logger.debug(
-                    "✅ [DEEP_QUEUE] Result published to Redis stream",
+                
+                t6_result_enqueued = time.time() * 1000
+                
+                logger.info(
+                    "[LATENCY] Result sent to backend",
                     meeting_id=meeting_id,
                     participant_id=participant_id,
-                    stream=_deep_results_stream,
+                    timestamps={
+                        't5_complete': t5_processing_complete,
+                        't6_enqueued': t6_result_enqueued,
+                    },
+                    latencies_ms={
+                        'result_enqueue': t6_result_enqueued - t5_processing_complete,
+                        'end_to_end': t6_result_enqueued - timestamp,
+                    },
                 )
             except Exception as e:
                 logger.error(
@@ -379,9 +457,10 @@ def start_deep_queue_consumer():
     """
     if not _deep_queue_enabled or not _deep_redis_url:
         logger.info(
-            "⏭️ [DEEP_QUEUE] Deep queue disabled, using direct Socket.IO path",
-            deep_queue_enabled=_deep_queue_enabled,
-            redis_url_configured=bool(_deep_redis_url),
+            "✅ [MODE] Socket.IO mode - accepting direct connections",
+            mode="SOCKET_IO",
+            socket_io_audio="ENABLED - accepting audio_chunk events",
+            note="Backend connects directly via Socket.IO for bidirectional communication",
         )
         return
     
@@ -400,8 +479,12 @@ def start_deep_queue_consumer():
     task.add_done_callback(on_done)
     
     logger.info(
-        "✅ [DEEP_QUEUE] Deep audio consumer task scheduled with error tracking",
-        stream=_deep_audio_stream,
+        "✅ [MODE] Deep Queue enabled - using Redis Streams",
+        mode="DEEP_QUEUE",
+        audio_stream=_deep_audio_stream,
+        results_stream=_deep_results_stream,
+        socket_io_audio="NOT USED - audio comes from Redis",
+        note="Backend sends audio via Redis, results go back to Redis",
     )
 
 

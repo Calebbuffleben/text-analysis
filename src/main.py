@@ -6,6 +6,7 @@ Integra FastAPI (para endpoints REST) com Socket.IO (para comunicação real-tim
 import uvicorn
 import structlog
 import time
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -40,15 +41,25 @@ else:
             drop_missing=True
         )
 
-# DIAGNÓSTICO: Configurar nível de log baseado em LOG_LEVEL
+# Configure logging: align stdlib logging with structlog to avoid duplication
 import logging
 log_level_str = os.getenv('LOG_LEVEL', 'INFO').upper()
 log_level = getattr(logging, log_level_str, logging.INFO)
-logging.basicConfig(level=log_level)
 
+# Configure stdlib logging to use minimal formatting (structlog handles the rest)
+logging.basicConfig(
+    level=log_level,
+    format='%(message)s',  # structlog processors will handle formatting
+    handlers=[logging.StreamHandler()]
+)
+
+# Clear default handlers to avoid duplication
+logging.root.handlers = []
+
+# Configure structlog with stdlib integration
 structlog.configure(
     processors=[
-        structlog.stdlib.filter_by_level,  # Este processor filtra por nível
+        structlog.stdlib.filter_by_level,
         structlog.stdlib.add_logger_name,
         structlog.stdlib.add_log_level,
         structlog.stdlib.PositionalArgumentsFormatter(),
@@ -64,9 +75,6 @@ structlog.configure(
     cache_logger_on_first_use=True,
 )
 
-# DIAGNÓSTICO: Log de configuração
-print(f"[DIAGNÓSTICO] Structlog configurado - LOG_LEVEL={log_level_str}, log_level={log_level}")
-
 logger = structlog.get_logger()
 
 # Log de inicialização do structlog
@@ -76,22 +84,39 @@ logger.info(
     log_level=os.getenv('LOG_LEVEL', 'INFO')
 )
 
-# Criar app FastAPI
+# Lifespan context manager para startup e shutdown
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    FastAPI lifespan context manager - handles startup and shutdown events.
+    Replaces deprecated @on_event("startup") decorator.
+    """
+    # Startup
+    logger.info("🚀 [STARTUP] Initializing services...")
+    from .socketio_server import start_deep_queue_consumer, transcription_service
+    
+    # Pre-load faster-whisper model during startup to eliminate first-transcription delay
+    if transcription_service:
+        logger.info("🔄 [STARTUP] Pre-loading faster-whisper model...")
+        await transcription_service.ensure_model_loaded()
+        logger.info("✅ [STARTUP] Faster-whisper model pre-loaded")
+    
+    # Initialize deep queue consumer
+    start_deep_queue_consumer()
+    logger.info("✅ [STARTUP] Startup complete")
+    
+    yield
+    
+    # Shutdown (if needed in future)
+    logger.info("🛑 [SHUTDOWN] Shutting down...")
+
+# Criar app FastAPI com lifespan
 fastapi_app = FastAPI(
     title="Text Analysis Service",
     description="Serviço de análise de texto com BERT para português",
-    version="1.0.0"
+    version="1.0.0",
+    lifespan=lifespan
 )
-
-@fastapi_app.on_event("startup")
-async def startup_event():
-    """
-    FastAPI startup event - initialize deep queue consumer here.
-    """
-    from .socketio_server import start_deep_queue_consumer
-    logger.info("🚀 [STARTUP] FastAPI startup event - initializing deep queue consumer...")
-    start_deep_queue_consumer()
-    logger.info("✅ [STARTUP] Startup event complete")
 
 # Configurar CORS para permitir requisições HTTP de polling do Socket.IO
 fastapi_app.add_middleware(

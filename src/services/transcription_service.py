@@ -1,24 +1,17 @@
-"""
-Serviço de transcrição de áudio usando faster-whisper.
-Recebe chunks de áudio WAV e retorna transcrições em texto.
-
-faster-whisper é uma implementação otimizada do Whisper que:
-- É mais rápida (até 4x mais rápida que openai-whisper)
-- Usa menos memória
-- Suporta os mesmos modelos (tiny, base, small, medium, large)
-- Funciona melhor em CPU com compute_type="int8"
-"""
-
 import io
 import asyncio
 import time
 import re
 import structlog
+import soundfile as sf
+from threading import Lock
 from faster_whisper import WhisperModel
 import numpy as np
+from scipy.ndimage import uniform_filter1d
 from typing import Optional, Dict, Any, List
 from concurrent.futures import ThreadPoolExecutor
 from ..config import Config
+from .preprocess_pipeline import PreprocessPipeline
 
 logger = structlog.get_logger()
 
@@ -26,35 +19,50 @@ logger = structlog.get_logger()
 class TranscriptionService:
     """
     Serviço de transcrição de áudio usando faster-whisper.
-    
-    faster-whisper é uma implementação otimizada do Whisper da OpenAI,
-    otimizada para múltiplos idiomas incluindo português.
-    
-    Características:
-    - Suporta múltiplos idiomas (português incluído)
-    - Modelos leves disponíveis (tiny, base, small, medium, large)
-    - Funciona em CPU e GPU
-    - Mais rápido e eficiente que openai-whisper
-    - Lazy loading do modelo (carrega apenas quando necessário)
     """
     
     def __init__(self):
         """
         Inicializa serviço de transcrição.
-        O modelo Whisper será carregado apenas na primeira transcrição (lazy loading).
+        O modelo Whisper pode ser pré-carregado no startup ou lazy-loaded na primeira transcrição.
         """
         self.model = None
         self._loaded = False
+        self._load_lock = Lock()  # Thread-safe lock for model loading
+        self._loading = False  # Flag to prevent concurrent loads
         self.model_name = Config.WHISPER_MODEL_NAME
         self.device = Config.WHISPER_DEVICE
         self.language = Config.WHISPER_LANGUAGE
         self.task = Config.WHISPER_TASK
         
         # faster-whisper compute_type: "int8" para CPU (mais rápido), "float16" para GPU
+        # NÃO aceita "cpu" como valor - deve ser "int8" ou "float16"
         import os
-        compute_type_env = os.getenv('WHISPER_COMPUTE_TYPE', '')
+        compute_type_env = os.getenv('WHISPER_COMPUTE_TYPE', '').strip().lower()
         if compute_type_env:
-            self.compute_type = compute_type_env
+            # Validar e normalizar compute_type
+            # Converter valores legados/comuns para valores válidos
+            if compute_type_env == 'cpu':
+                # Valor legado: converter "cpu" para "int8"
+                self.compute_type = "int8"
+                logger.warn(
+                    "⚠️ [TRANSCRIÇÃO] WHISPER_COMPUTE_TYPE='cpu' é inválido, convertendo para 'int8'",
+                    old_value="cpu",
+                    new_value="int8",
+                    note="faster-whisper requer 'int8' ou 'float16' para CPU, não 'cpu'"
+                )
+            elif compute_type_env in ('int8', 'int8_float16', 'float16'):
+                # Valores válidos do faster-whisper
+                self.compute_type = compute_type_env
+            else:
+                # Valor inválido: usar padrão baseado no device
+                logger.warn(
+                    "⚠️ [TRANSCRIÇÃO] WHISPER_COMPUTE_TYPE inválido, usando padrão baseado em device",
+                    invalid_value=compute_type_env,
+                    device=self.device,
+                    note="Valores válidos: 'int8', 'int8_float16', 'float16'"
+                )
+                self.compute_type = "int8" if self.device == "cpu" else "float16"
         else:
             # Auto-detect: int8 para CPU, float16 para GPU
             self.compute_type = "int8" if self.device == "cpu" else "float16"
@@ -72,13 +80,15 @@ class TranscriptionService:
         )
         
         # Semáforo para limitar transcrições simultâneas
-        # faster-whisper é mais eficiente, mas ainda limitamos a 1 transcrição por vez
-        # para evitar sobrecarga e garantir que cada transcrição tenha recursos completos
+        # Configurável via MAX_CONCURRENT_TRANSCRIPTIONS (default: 2)
+        # Permite processar múltiplos participantes em paralelo
+        max_concurrent = Config.MAX_CONCURRENT_TRANSCRIPTIONS
         try:
-            self._transcription_semaphore = asyncio.Semaphore(1)
+            self._transcription_semaphore = asyncio.Semaphore(max_concurrent)
         except RuntimeError:
             # Se não houver event loop, criar None e inicializar depois
             self._transcription_semaphore = None
+        self._max_concurrent = max_concurrent
         self._active_transcriptions = 0
         
         # Duração mínima de áudio para transcrição (em segundos)
@@ -106,21 +116,62 @@ class TranscriptionService:
         # ThreadPoolExecutor para executar faster-whisper em thread separada
         # faster-whisper é mais rápido mas ainda bloqueante, então executamos em thread separada
         # para não bloquear o event loop do asyncio
-        self._executor = ThreadPoolExecutor(max_workers=1)
+        # Número de workers = max_concurrent para permitir paralelismo
+        self._executor = ThreadPoolExecutor(max_workers=max_concurrent)
         
+        self._preprocess_pipeline = PreprocessPipeline(
+            min_audio_duration_sec=self._min_audio_duration_sec,
+            rms_speech_threshold_db=self._rms_speech_threshold_db,
+            language=self.language,
+            task=self.task,
+            decode_wav=self._decode_wav,
+            has_speech_rms_with_level=self._has_speech_rms_with_level,
+            trim_silence=self._trim_silence,
+            estimate_snr=self._estimate_snr
+        )
+
         logger.info(
             "✅ [SERVIÇO] TranscriptionService inicializado",
             model=self.model_name,
             device=self.device,
             language=self.language,
-            max_concurrent_transcriptions=1,
+            max_concurrent_transcriptions=max_concurrent,
             min_audio_duration_sec=self._min_audio_duration_sec,
             rms_speech_threshold_db=self._rms_speech_threshold_db
         )
     
+    async def ensure_model_loaded(self):
+        """
+        Pre-load model during startup. Thread-safe and idempotent.
+        Can be called multiple times safely - only loads once.
+        """
+        if self._loaded:
+            return
+        
+        with self._load_lock:
+            if self._loaded:
+                return
+            
+            if self._loading:
+                pass
+            else:
+                self._loading = True
+
+        if self._loading and not self._loaded:
+            try:
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(self._executor, self._load_model)
+                logger.info("✅ [TRANSCRIÇÃO] Model pre-loaded successfully during startup")
+            finally:
+                with self._load_lock:
+                    self._loading = False
+        else:
+            while self._loading and not self._loaded:
+                await asyncio.sleep(0.1)
+    
     def _load_model(self):
         """
-        Carrega modelo faster-whisper (lazy loading).
+        Carrega modelo faster-whisper.
         
         Modelos disponíveis (do menor ao maior):
         - tiny: ~39M parâmetros, mais rápido, menos preciso
@@ -129,14 +180,9 @@ class TranscriptionService:
         - medium: ~769M parâmetros, muito preciso
         - large: ~1550M parâmetros, mais preciso, mais lento
         
-        O modelo escolhido (base por padrão) oferece bom equilíbrio
-        entre velocidade e precisão para transcrições em tempo real.
-        
-        faster-whisper é mais rápido que openai-whisper, especialmente em CPU
-        com compute_type="int8".
         """
+        # Double-check: already loaded
         if self._loaded:
-            logger.debug("Modelo faster-whisper já carregado", model=self.model_name)
             return
         
         logger.info(
@@ -149,7 +195,8 @@ class TranscriptionService:
         load_start = time.perf_counter()
         
         try:
-            # faster-whisper aceita "cpu" ou "cuda" diretamente
+            # faster-whisper compute_type deve ser "int8", "int8_float16" ou "float16"
+            # device deve ser "cpu" ou "cuda"
             # Ele mesmo verifica se CUDA está disponível, então não precisamos verificar manualmente
             device = self.device
             compute_type = self.compute_type
@@ -244,22 +291,16 @@ class TranscriptionService:
         result = service.transcribe_audio(wav_bytes, sample_rate=16000, language='pt')
         print(result['text'])  # "Olá, como você está?"
         """
-        # Carregar modelo de forma assíncrona se necessário
-        if not self._loaded:
-            logger.info("🔄 [TRANSCRIÇÃO] Modelo não carregado, carregando agora...")
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(
-                self._executor,
-                self._load_model
-            )
-            logger.info("✅ [TRANSCRIÇÃO] Modelo carregado, prosseguindo com transcrição")
+        t_start = time.time() * 1000  # ms
+        
+        # Ensure model is loaded (thread-safe, idempotent)
+        await self.ensure_model_loaded()
         
         # Inicializar semáforo se ainda não foi criado (fallback)
         if self._transcription_semaphore is None:
-            self._transcription_semaphore = asyncio.Semaphore(1)
+            self._transcription_semaphore = asyncio.Semaphore(self._max_concurrent)
         
         try:
-            # FASE 2: Validações rápidas (<1ms, no event loop)
             # Validações que não bloqueiam o event loop
             if sample_rate <= 0:
                 logger.warn(
@@ -273,7 +314,6 @@ class TranscriptionService:
                     'confidence': 0.0
                 }
             
-            # FASE 2: Pré-processamento no executor (não bloqueia event loop)
             # Todas as operações bloqueantes (decode_wav, RMS, trim, SNR) são executadas
             # em thread separada, permitindo que o event loop processe outros eventos
             # (ex: health_ping, outros handlers Socket.IO)
@@ -290,39 +330,68 @@ class TranscriptionService:
                 expected_sample_rate=sample_rate
             )
             
-            # Executar pré-processamento no executor (FASE 2)
             # Operações bloqueantes: _decode_wav(), _has_speech_rms(), _trim_silence(), _estimate_snr()
             # Isso libera o event loop para processar outros eventos (ex: health_ping)
             preprocess_result = await loop.run_in_executor(
                 self._executor,
-                self._preprocess_audio_sync,
+                self._preprocess_pipeline.run,
                 audio_data,
                 sample_rate,
                 language
             )
             
-            # Verificar se pré-processamento foi bem-sucedido
-            if preprocess_result is None:
-                logger.warn(
-                    "⏭️ [TRANSCRIÇÃO] Pré-processamento rejeitou áudio (validação falhou)",
+            t_after_preprocess = time.time() * 1000  # ms
+            
+            # Verificar se áudio foi classificado como tendo fala
+            # Se has_speech=False, retornar imediatamente SEM processamento Whisper
+            if not preprocess_result.get('has_speech', False):
+                reason = preprocess_result.get('rejection_reason', 'unknown')
+                rms_db = preprocess_result.get('rms_max_db', -float('inf'))
+                audio_duration = preprocess_result.get('audio_duration_sec', 0.0)
+                
+                # Log de latência para áudio rejeitado rapidamente
+                logger.info(
+                    "[LATENCY] Audio rejected quickly",
+                    latencies_ms={
+                        'preprocess_only': round(t_after_preprocess - t_start, 2),
+                        'whisper_skipped': True,
+                        'total': round(t_after_preprocess - t_start, 2)
+                    },
+                    classification={
+                        'has_speech': False,
+                        'reason': reason,
+                        'rms_max_db': round(rms_db, 2),
+                        'rms_threshold_db': self._rms_speech_threshold_db,
+                        'audio_duration_sec': round(audio_duration, 3)
+                    },
                     audio_size_bytes=len(audio_data),
-                    sample_rate=sample_rate,
-                    reason="preprocess_result is None - possible causes: decode failed, no speech detected, audio too short after trim"
+                    note="Áudio descartado SEM custo de transcrição Whisper - pipeline continua fluindo"
                 )
+                
                 return {
                     'text': '',
                     'language': language or self.language,
                     'segments': [],
-                    'confidence': 0.0
+                    'confidence': 0.0,
+                    'has_speech': False,
+                    'rejection_reason': reason,
+                    'rms_max_db': rms_db
                 }
             
-            # Extrair dados do pré-processamento
+            # Se chegou aqui: has_speech=True, extrair dados do pré-processamento para transcrição
+            # Dado do áudio decodificado e processado para transcrição            
             audio_array = preprocess_result['audio_array']
+            # Informações do trim de silêncio
             trim_info = preprocess_result['trim_info']
+            # SNR estimado
             estimated_snr_db = preprocess_result['estimated_snr_db']
+            # Tamanho do beam search
             beam_size = preprocess_result['beam_size']
+            # Se o VAD foi usado
             use_vad = preprocess_result['use_vad']
+            # Duração do áudio após o trim de silêncio
             audio_duration_sec_after_trim = preprocess_result['audio_duration_sec_after_trim']
+            # Opções de transcrição
             transcribe_options = preprocess_result['transcribe_options']
             
             logger.debug(
@@ -345,7 +414,7 @@ class TranscriptionService:
                 device=self.device
             )
             
-            # FASE 3: Transcrição (semáforo + executor)
+            # Transcrição com Whisper (semáforo + executor)
             # O semáforo é usado APENAS para limitar transcrições simultâneas do Whisper
             # Pré-processamento já foi executado no executor, fora do semáforo
             # Isso garante que o event loop permanece livre durante pré-processamento
@@ -360,7 +429,7 @@ class TranscriptionService:
                 active_transcriptions=self._active_transcriptions
             )
             
-            # FASE 3: Adquirir semáforo APENAS para transcrição do Whisper
+            # Adquirir semáforo APENAS para transcrição do Whisper
             # Pré-processamento não precisa do semáforo (já executado no executor)
             # Semáforo garante que apenas uma transcrição Whisper execute por vez
             
@@ -392,64 +461,36 @@ class TranscriptionService:
                     
                     # Criar função de transcrição para o executor
                     # faster-whisper retorna (segments, info) ao invés de dict
+                    # Referenciar model, audio, options, language e sample_rate no closure
                     model_ref = self.model
+                    # Copiar audio_array para evitar modificações no original
                     audio_ref = audio_array.copy()
+                    # Copiar options para evitar modificações no original
                     options_ref = transcribe_options.copy()
-                    language_ref = language or self.language  # Capturar language no closure
-                    sample_rate_ref = preprocess_result['sample_rate']  # Capturar sample_rate no closure
-                    
+                    # Capturar language no closure
+                    language_ref = language or self.language 
+                    # Capturar sample_rate no closure
+                    sample_rate_ref = preprocess_result['sample_rate']  
+                    # Criar função de transcrição para o executor
                     def transcribe_sync():
                         try:
                             # faster-whisper retorna (segments, info)
+                            # Transcrição com Whisper (semáforo + executor)
                             # segments é um iterador de objetos Segment
                             segments, info = model_ref.transcribe(audio_ref, **options_ref)
                             
                             # Converter segments para lista e processar
                             segments_list = list(segments)
                             
-                            # P3.1: Filtrar segmentos por no_speech_prob e avg_logprob antes de concatenar
-                            # Ignorar segmentos com alta probabilidade de não ter fala ou baixa confiança
-                            # Isso remove alucinações já detectadas pelo Whisper
-                            filtered_segments = []
-                            filtered_count = 0
-                            for seg in segments_list:
-                                no_speech_prob = getattr(seg, 'no_speech_prob', 0.0)
-                                avg_logprob = getattr(seg, 'avg_logprob', 0.0)
-                                
-                                # Manter apenas segmentos com:
-                                # - no_speech_prob <= 0.6 (probabilidade de não ter fala baixa)
-                                # - avg_logprob > -1.0 (confiança razoável)
-                                if no_speech_prob <= 0.6 and avg_logprob > -1.0:
-                                    filtered_segments.append(seg)
-                                else:
-                                    filtered_count += 1
-
-                            used_unfiltered_segments = False
-                            # Se o filtro removeu TUDO mas o Whisper retornou segmentos, preferimos
-                            # retornar os segmentos originais ao invés de "sumir" com o texto.
-                            # Isso evita falsos "segments_count=0" que quebram o pipeline no fim da conversa.
-                            if len(segments_list) > 0 and len(filtered_segments) == 0:
-                                used_unfiltered_segments = True
-                                filtered_segments = segments_list
+                            # Construir texto completo concatenando todos os segmentos
+                            text = " ".join(seg.text for seg in segments_list).strip()
                             
-                            # Construir texto completo concatenando apenas segmentos filtrados
-                            text = " ".join(seg.text for seg in filtered_segments).strip()
-                            
-                            # FASE 3: Aplicar pós-processamento para corrigir erros comuns de transcrição
+                            # Aplicar pós-processamento para corrigir erros comuns de transcrição
                             text = self._fix_common_transcription_errors(text)
                             
-                            # Log de filtragem para diagnóstico
-                            if filtered_count > 0:
-                                logger.debug(
-                                    "🔍 [P3.1] Segmentos filtrados",
-                                    total_segments=len(segments_list),
-                                    filtered_out=filtered_count,
-                                    kept_segments=len(filtered_segments)
-                                )
-                            
-                            # Converter segments filtrados para formato dict compatível
+                            # Converter segments para formato dict compatível
                             segments_dict = []
-                            for seg in filtered_segments:
+                            for seg in segments_list:
                                 segments_dict.append({
                                     'start': seg.start,
                                     'end': seg.end,
@@ -466,14 +507,12 @@ class TranscriptionService:
                                 'language_probability': getattr(info, 'language_probability', 1.0),
                                 'segments': segments_dict,
                                 '_raw_segments_count': len(segments_list),
-                                '_used_unfiltered_segments': used_unfiltered_segments,
                                 'duration': getattr(info, 'duration', len(audio_ref) / sample_rate_ref)
                             }
                         except Exception as e:
                             logger.error(f"Erro dentro do transcribe_sync: {e}")
                             raise
-                    
-                    # Adicionar timeout de 30 segundos
+
                     # faster-whisper é mais rápido: tiny < 2s, base < 5s, small < 10s para 8s de áudio
                     task = loop.run_in_executor(self._executor, transcribe_sync)
                     result = await asyncio.wait_for(task, timeout=30.0)
@@ -626,6 +665,30 @@ class TranscriptionService:
                     finally:
                         self._active_transcriptions -= 1
             
+            t_after_transcription = time.time() * 1000  # ms
+            
+            logger.info(
+                "[LATENCY] Transcription timing",
+                latencies_ms={
+                    'preprocess': round(t_after_preprocess - t_start, 2),
+                    'transcription': round(t_after_transcription - t_after_preprocess, 2),
+                    'total': round(t_after_transcription - t_start, 2),
+                    'whisper_skipped': False
+                },
+                classification={
+                    'has_speech': True,
+                    'rms_max_db': round(preprocess_result.get('rms_max_db', 0.0), 2),
+                    'rms_threshold_db': self._rms_speech_threshold_db,
+                    'audio_duration_sec_after_trim': round(preprocess_result.get('audio_duration_sec_after_trim', 0.0), 3)
+                },
+                result={
+                    'text_length': len(text) if 'text' in locals() and text else 0,
+                    'confidence': result.get('confidence', 0.0) if result else 0.0,
+                    'segments_count': len(segments) if 'segments' in locals() and segments else 0
+                },
+                note="Áudio com fala processado completamente via Whisper"
+            )
+            
             # Calcular confiança média dos segmentos (após filtro P3.1)
             confidence = 0.0
             if segments:
@@ -762,96 +825,82 @@ class TranscriptionService:
     
     def _decode_wav(self, wav_data: bytes, expected_sample_rate: int) -> Optional[np.ndarray]:
         """
-        Decodifica dados WAV para array numpy.
-        
-        O formato WAV esperado:
-        - Header de 44 bytes
-        - Dados PCM16LE (16-bit little-endian)
-        - Mono ou estéreo
-        
-        Retorna:
-        - Array numpy float32 normalizado (-1.0 a 1.0)
-        - Taxa de amostragem ajustada se necessário
+        Decodifica dados WAV para array numpy usando soundfile.
+        O soundfile lida automaticamente com a decodificação e normalização.     
+        Args:
+            wav_data: Bytes do arquivo WAV (incluindo header)
+            expected_sample_rate: Taxa de amostragem desejada (Hz)
+        Returns:
+            Array numpy float32 normalizado (-1.0 a 1.0), mono, na taxa expected_sample_rate.
+            None em caso de erro na decodificação.
         """
         try:
-            import wave
+            # Ler WAV usando soundfile (suporta PCM 16/24/32-bit e float nativamente)
+            # soundfile já retorna float32 normalizado em [-1, 1]
+            audio_float, sample_rate = sf.read(io.BytesIO(wav_data), dtype='float32')
             
-            # Criar arquivo WAV em memória
-            wav_file = io.BytesIO(wav_data)
+            # Converter estéreo para mono (média dos canais)
+            if audio_float.ndim == 2:
+                audio_float = audio_float.mean(axis=1)
             
-            # Ler WAV usando wave module
-            with wave.open(wav_file, 'rb') as wf:
-                sample_rate = wf.getframerate()
-                num_channels = wf.getnchannels()
-                sample_width = wf.getsampwidth()
-                num_frames = wf.getnframes()
-                
-                # Ler dados de áudio
-                audio_bytes = wf.readframes(num_frames)
-                
-                # Converter bytes para array numpy
-                if sample_width == 2:  # 16-bit
-                    audio_array = np.frombuffer(audio_bytes, dtype=np.int16)
-                elif sample_width == 4:  # 32-bit
-                    audio_array = np.frombuffer(audio_bytes, dtype=np.int32)
-                else:
-                    logger.warn(f"Unsupported sample width: {sample_width}")
-                    return None
-                
-                # Converter para float32 e normalizar (-1.0 a 1.0)
-                # Para int16: dividir por 32768.0
-                # Para int32: dividir por 2147483648.0
-                if sample_width == 2:
-                    audio_float = audio_array.astype(np.float32) / 32768.0
-                else:
-                    audio_float = audio_array.astype(np.float32) / 2147483648.0
-                
-                # Converter estéreo para mono (média dos canais)
-                if num_channels == 2:
-                    # Garantir que o array tenha número par de samples para reshape
-                    if len(audio_float) % 2 != 0:
-                        # Se ímpar, remover último sample para permitir reshape
-                        audio_float = audio_float[:-1]
-                    if len(audio_float) >= 2:
-                        audio_float = audio_float.reshape(-1, 2).mean(axis=1)
-                    # Se após remoção ficou muito curto (< 2), manter como está (tratar como mono)
-                
-                # Resample se necessário (Whisper funciona melhor com 16kHz)
-                # Nota: Se o áudio já estiver em 16kHz, não precisa resample
-                if sample_rate != expected_sample_rate:
-                    try:
-                        from scipy import signal
-                        num_samples = int(len(audio_float) * expected_sample_rate / sample_rate)
-                        if num_samples > 0:
-                            audio_float = signal.resample(audio_float, num_samples)
-                            logger.debug(
-                                "Audio resampled",
-                                from_rate=sample_rate,
-                                to_rate=expected_sample_rate,
-                                original_samples=len(audio_array),
-                                resampled_samples=num_samples
-                            )
-                        else:
-                            logger.warn("Invalid resample target, keeping original sample rate")
-                    except ImportError:
-                        logger.warn("scipy not available, skipping resample - Whisper will handle it")
-                        # Whisper pode lidar com diferentes sample rates, mas 16kHz é ideal
-                    except Exception as e:
-                        logger.warn(f"Resample failed: {e}, keeping original sample rate")
-                else:
-                    logger.debug("Audio already at target sample rate, no resample needed")
-                
-                return audio_float
+            # Resample se necessário (Whisper funciona melhor com 16kHz)
+            # Nota: Se o áudio já estiver na taxa esperada, não precisa resample
+            if sample_rate != expected_sample_rate:
+                try:
+                    from scipy import signal
+                    original_samples = len(audio_float)
+                    num_samples = int(original_samples * expected_sample_rate / sample_rate)
+                    if num_samples > 0:
+                        audio_float = signal.resample(audio_float, num_samples)
+                        logger.debug(
+                            "Audio resampled",
+                            from_rate=sample_rate,
+                            to_rate=expected_sample_rate,
+                            original_samples=original_samples,
+                            resampled_samples=num_samples
+                        )
+                    else:
+                        logger.warn("Invalid resample target, keeping original sample rate")
+                except ImportError:
+                    logger.warn("scipy not available, skipping resample - Whisper will handle it")
+                    # Whisper pode lidar com diferentes sample rates, mas 16kHz é ideal
+                except Exception as e:
+                    logger.warn(f"Resample failed: {e}, keeping original sample rate")
+            else:
+                logger.debug("Audio already at target sample rate, no resample needed")
+            
+            return audio_float
                 
         except Exception as e:
             logger.error("Failed to decode WAV", error=str(e))
             return None
     
+    def _rms_max_over_windows(self, audio_array: np.ndarray, window_samples: int) -> float:
+        """
+        Usa média móvel (uniform_filter1d) sobre o sinal ao quadrado para obter
+        RMS por "frame" e retorna o máximo.
+        
+        Args:
+            audio_array: Array numpy de áudio normalizado (-1 a 1)
+            window_samples: Tamanho da janela em amostras (>= 1)
+        
+        Returns:
+            Máximo RMS encontrado em qualquer janela (linear, não dB).
+            Retorna 0.0 se audio_array estiver vazio.
+        """
+        if len(audio_array) == 0:
+            return 0.0
+        if window_samples < 1:
+            window_samples = 1
+        size = min(window_samples, len(audio_array))
+        squared = audio_array.astype(np.float64) ** 2
+        mean_sq = uniform_filter1d(squared, size=size, mode='constant', cval=0.0)
+        rms_per_frame = np.sqrt(np.maximum(mean_sq, 0.0))
+        return float(np.max(rms_per_frame))
+    
     def _has_speech_rms(self, audio_array: np.ndarray, sample_rate: int, 
                        rms_threshold_db: float = -40.0, window_size_ms: int = 100) -> bool:
         """
-        P1.2: Detecta se o áudio contém fala baseado em RMS (Root Mean Square).
-        
         Calcula RMS em janelas curtas e verifica se algum trecho tem energia suficiente
         para indicar fala. Mais leve que VAD completo e eficaz para filtrar silêncio.
         
@@ -882,23 +931,11 @@ class TranscriptionService:
         if window_samples < 1:
             window_samples = 1
         
-        # Calcular RMS em janelas sobrepostas
-        # Garantir que step_size nunca seja 0 (proteger contra window_samples = 1)
-        step_size = max(1, window_samples // 2)  # Overlap de 50%, mínimo 1
-        max_rms = 0.0
-        for i in range(0, len(audio_array), step_size):
-            window = audio_array[i:i + window_samples]
-            if len(window) == 0:
-                break
-            
-            # RMS = sqrt(mean(samples^2))
-            rms = np.sqrt(np.mean(window ** 2))
-            max_rms = max(max_rms, rms)
-        
+        max_rms = self._rms_max_over_windows(audio_array, window_samples)
         has_speech = max_rms >= rms_threshold_linear
         
-        logger.debug(
-            "🔍 [PRÉ-PROCESSAMENTO] Verificação RMS de fala",
+        logger.info(
+            "🔍 [RMS_DEBUG] Verificação RMS de fala",
             max_rms_db=round(20 * np.log10(max_rms + 1e-10), 2),
             threshold_db=rms_threshold_db,
             has_speech=has_speech,
@@ -907,12 +944,53 @@ class TranscriptionService:
         
         return has_speech
     
+    def _has_speech_rms_with_level(self, audio_array: np.ndarray, sample_rate: int) -> tuple:
+        """
+        Detecta fala via RMS e retorna o nível máximo encontrado.
+        
+        Similar a _has_speech_rms, mas retorna também o nível RMS máximo em dB
+        para permitir logging e calibração do threshold.
+        
+        Args:
+            audio_array: Array numpy de áudio normalizado (-1 a 1)
+            sample_rate: Taxa de amostragem em Hz
+        
+        Returns:
+            Tuple[bool, float]: (has_speech, max_rms_db)
+                - has_speech: True se detectar fala, False caso contrário
+                - max_rms_db: Nível RMS máximo encontrado em dB
+        """
+        if len(audio_array) == 0:
+            return False, -float('inf')
+        
+        # Validar sample_rate antes de usar
+        if sample_rate <= 0:
+            logger.warn("⚠️ [PRÉ-PROCESSAMENTO] Sample rate inválido para detecção RMS", sample_rate=sample_rate)
+            return False, -float('inf')
+        
+        # Usar threshold configurado
+        rms_threshold_db = self._rms_speech_threshold_db
+        window_size_ms = 100
+        
+        # Converter threshold dB para linear (RMS)
+        rms_threshold_linear = 10 ** (rms_threshold_db / 20.0)
+        
+        # Calcular tamanho da janela em samples
+        window_samples = int(sample_rate * window_size_ms / 1000.0)
+        if window_samples < 1:
+            window_samples = 1
+        
+        max_rms = self._rms_max_over_windows(audio_array, window_samples)
+        # Converter para dB
+        max_rms_db = 20 * np.log10(max_rms + 1e-10)
+        has_speech = max_rms >= rms_threshold_linear
+        
+        return has_speech, max_rms_db
+    
     def _trim_silence(self, audio_array: np.ndarray, sample_rate: int,
                      silence_threshold_db: float = -35.0, frame_length_ms: int = 50,
                      hop_length_ms: int = 25):
         """
-        P1.3: Remove silêncio inicial e final do áudio.
-        
         Remove períodos de silêncio que causam alucinações do Whisper.
         Mantém padding mínimo para preservar contexto de fala.
         
@@ -1007,8 +1085,6 @@ class TranscriptionService:
     def _estimate_snr(self, audio_array: np.ndarray, sample_rate: int,
                      frame_length_ms: int = 100) -> float:
         """
-        P2.2: Estima SNR (Signal-to-Noise Ratio) do áudio usando análise de energia.
-        
         Calcula diferença entre energia em regiões de fala vs silêncio.
         Usado para decidir se VAD pode ser usado com segurança.
         
@@ -1031,19 +1107,15 @@ class TranscriptionService:
         if frame_samples < 1:
             frame_samples = 1
         
-        # Calcular energia RMS por frame
-        frame_energies = []
-        for i in range(0, len(audio_array), frame_samples):
-            frame = audio_array[i:i + frame_samples]
-            if len(frame) == 0:
-                break
-            rms = np.sqrt(np.mean(frame ** 2))
-            frame_energies.append(rms)
-        
-        if len(frame_energies) < 2:
+        # Calcular energia RMS por frame usando numpy vetorizado
+        num_frames = len(audio_array) // frame_samples
+        if num_frames < 2:
             return -999.0
         
-        frame_energies = np.array(frame_energies)
+        # Truncar para múltiplos de frame_samples e reshape em matriz
+        truncated = audio_array[:num_frames * frame_samples]
+        frames = truncated.reshape(num_frames, frame_samples)
+        frame_energies = np.sqrt(np.mean(frames**2, axis=1))
         
         # Estimar energia de sinal (frames com maior energia - percentil 75)
         # Estimar energia de ruído (frames com menor energia - percentil 25)
@@ -1066,199 +1138,16 @@ class TranscriptionService:
         
         return float(snr_db)
     
-    def _preprocess_audio_sync(
-        self,
-        audio_data: bytes,
-        sample_rate: int,
-        language: Optional[str] = None
-    ) -> Optional[Dict[str, Any]]:
-        """
-        Fase 1: Pré-processamento de áudio executado em thread separada (síncrono).
-        
-        Encapsula todas as operações bloqueantes de pré-processamento:
-        - Decodificação WAV
-        - Validações de áudio
-        - Detecção de fala (RMS)
-        - Trim de silêncio
-        - Estimação de SNR
-        - Cálculo de parâmetros para transcrição
-        
-        Esta função é executada no ThreadPoolExecutor para não bloquear o event loop.
-        
-        Args:
-            audio_data: Bytes do arquivo WAV (incluindo header)
-            sample_rate: Taxa de amostragem do áudio (Hz)
-            language: Idioma do áudio (opcional)
-        
-        Returns:
-            Dict com dados de pré-processamento se sucesso, None se validação falhar:
-            {
-                'audio_array': np.ndarray,  # Áudio processado e validado
-                'sample_rate': int,
-                'trim_info': dict,
-                'estimated_snr_db': float,
-                'beam_size': int,
-                'use_vad': bool,
-                'audio_duration_sec_after_trim': float,
-                'transcribe_options': dict  # Opções para model.transcribe()
-            }
-        """
-        try:
-            failure_reason = None
-            # Decodificar WAV para array numpy
-            # O Whisper espera áudio como array numpy float32 normalizado (-1 a 1)
-            audio_array = self._decode_wav(audio_data, sample_rate)
-            
-            if audio_array is None or len(audio_array) == 0:
-                logger.warn(
-                    "⚠️ [PRÉ-PROCESSAMENTO] Falha na decodificação WAV ou áudio vazio",
-                    audio_size_bytes=len(audio_data),
-                    sample_rate=sample_rate,
-                    reason="decode_wav retornou None ou array vazio"
-                )
-                return None
-            
-            # Filtrar chunks muito pequenos
-            audio_duration_sec = len(audio_array) / sample_rate
-            if audio_duration_sec < self._min_audio_duration_sec:
-                logger.debug(
-                    "⏭️ [PRÉ-PROCESSAMENTO] Áudio muito curto (antes de trim)",
-                    audio_duration_sec=round(audio_duration_sec, 3),
-                    min_duration_sec=self._min_audio_duration_sec,
-                    reason="Áudio menor que mínimo antes de trim"
-                )
-                return None
-            
-            # P1.2: Detecção de silêncio RMS - rejeitar chunks sem fala antes da transcrição
-            # Evita alucinações do Whisper em áudio silencioso ou muito quieto
-            has_speech = self._has_speech_rms(audio_array, sample_rate, self._rms_speech_threshold_db)
-            if not has_speech:
-                failure_reason = "no_speech_rms"
-                logger.debug(
-                    "⏭️ [PRÉ-PROCESSAMENTO] RMS não detectou fala",
-                    audio_duration_sec=round(audio_duration_sec, 3),
-                    sample_rate=sample_rate,
-                    reason="has_speech_rms retornou False - possível silêncio apenas"
-                )
-                # Fallback para buffers longos: evitar descartar conversa no fim
-                if audio_duration_sec >= 5.0:
-                    logger.warn(
-                        "⚠️ [PRÉ-PROCESSAMENTO] Fallback ativado (RMS sem fala, buffer longo)",
-                        audio_duration_sec=round(audio_duration_sec, 3),
-                        sample_rate=sample_rate,
-                        reason=failure_reason
-                    )
-                else:
-                    return None
-            
-            # P1.3: Trim de silêncio inicial/final - remove silêncio que causa alucinações
-            audio_array, trim_info = self._trim_silence(audio_array, sample_rate)
-            
-            # REVISADO P4.2: Verificar se após trim ainda há áudio suficiente para transcrição confiável
-            # Reduzido de 1.5s para 0.8s para permitir transcrições de áudio mais curto
-            # 1.5s era muito restritivo e rejeitava áudio válido (ex: respostas curtas)
-            audio_duration_sec_after_trim = len(audio_array) / sample_rate
-            min_audio_after_trim_sec = 0.8  # REVISADO: Reduzido de 1.5s para 0.8s (era 0.5s antes de P4.2)
-            if audio_duration_sec_after_trim < min_audio_after_trim_sec:
-                failure_reason = "too_short_after_trim"
-                logger.debug(
-                    "⏭️ [PRÉ-PROCESSAMENTO] Áudio muito curto após trim",
-                    audio_duration_sec_before_trim=round(audio_duration_sec, 3),
-                    audio_duration_sec_after_trim=round(audio_duration_sec_after_trim, 3),
-                    min_audio_after_trim_sec=min_audio_after_trim_sec,
-                    trim_start_sec=trim_info.get('trimmed_start_sec', 0),
-                    trim_end_sec=trim_info.get('trimmed_end_sec', 0),
-                    reason=f"Áudio após trim ({audio_duration_sec_after_trim:.2f}s) menor que mínimo ({min_audio_after_trim_sec}s)"
-                )
-                # Fallback para buffers longos: usar áudio original sem trim
-                if audio_duration_sec >= 5.0:
-                    logger.warn(
-                        "⚠️ [PRÉ-PROCESSAMENTO] Fallback ativado (trim reduziu demais)",
-                        audio_duration_sec=round(audio_duration_sec, 3),
-                        audio_duration_sec_after_trim=round(audio_duration_sec_after_trim, 3),
-                        min_audio_after_trim_sec=min_audio_after_trim_sec,
-                        reason=failure_reason
-                    )
-                    audio_array = self._decode_wav(audio_data, sample_rate)
-                    if audio_array is None or len(audio_array) == 0:
-                        return None
-                    trim_info = {'trimmed_start_sec': 0, 'trimmed_end_sec': 0}
-                    audio_duration_sec_after_trim = len(audio_array) / sample_rate
-                else:
-                    return None
-            
-            # P2.2: Estimar SNR para VAD seletivo e ajuste de parâmetros
-            estimated_snr_db = self._estimate_snr(audio_array, sample_rate)
-            
-            # P2.3: Ajustar beam_size conforme duração do áudio
-            # Áudio mais longo se beneficia de beam search maior
-            beam_size = 7 if audio_duration_sec_after_trim >= 10.0 else 5
-            
-            # P2.2: VAD seletivo - ativar apenas se SNR for suficientemente alto
-            # SNR alto = áudio limpo = VAD seguro. SNR baixo = risco de remover fala válida
-            use_vad = estimated_snr_db > 10.0  # Threshold de 10dB para considerar áudio "limpo"
-            
-            # P2.1: Ajustar thresholds baseado em qualidade de áudio para reduzir alucinações
-            # no_speech_threshold: 0.5 (mais restritivo que 0.3, menos alucinações)
-            # log_prob_threshold: -1.0 (menos restritivo que -0.8, não corta fala válida)
-            # compression_ratio_threshold: 2.4 (menos agressivo que 2.0, permite repetições naturais)
-            transcribe_options = {
-                'language': language or self.language,
-                'task': self.task,  # 'transcribe' ou 'translate'
-                'temperature': 0.0,  # Temperatura 0 = mais determinístico e preciso
-                'condition_on_previous_text': False,  # Evitar repetições quando texto anterior é ruim
-                'compression_ratio_threshold': 2.4,  # P2.1: Menos agressivo (era 2.0) - permite repetições naturais
-                'log_prob_threshold': -1.0,  # P2.1: Menos restritivo (era -0.8) - não corta fala válida
-                'no_speech_threshold': 0.5,  # P2.1: Mais restritivo (era 0.3) - reduz alucinações em silêncio
-                'beam_size': beam_size,  # P2.3: Dinâmico conforme duração (5 para <10s, 7 para ≥10s)
-                'vad_filter': use_vad,  # P2.2: Seletivo baseado em SNR estimado
-            }
-
-            # Se o fallback foi ativado, tornar a transcrição mais permissiva
-            if failure_reason in {"no_speech_rms", "too_short_after_trim"}:
-                transcribe_options = {
-                    **transcribe_options,
-                    'no_speech_threshold': 0.8,
-                    'vad_filter': False,
-                }
-            
-            return {
-                'audio_array': audio_array,
-                'sample_rate': sample_rate,
-                'trim_info': trim_info,
-                'estimated_snr_db': estimated_snr_db,
-                'beam_size': beam_size,
-                'use_vad': use_vad,
-                'audio_duration_sec_after_trim': audio_duration_sec_after_trim,
-                'transcribe_options': transcribe_options
-            }
-        except Exception as e:
-            # Log de erro silencioso (será logado na função chamadora se necessário)
-            # Retornar None indica falha no pré-processamento
-            return None
-    
     def _fix_common_transcription_errors(self, text: str) -> str:
         """
-        FASE 3: Corrige erros comuns de transcrição do Whisper em português.
-        
         Corrige erros de transcrição frequentes onde o Whisper separa incorretamente
         palavras compostas (ex: "a diário" → "adiar").
-        
-        Esta função apenas corrige erros, não rejeita texto, garantindo que
-        feedbacks válidos não sejam bloqueados.
-        
-        Args:
-            text: Texto transcrito a ser corrigido
-        
-        Returns:
-            Texto corrigido
         """
         if not text:
             return text
         
         original_text = text
         
-        # Correções de palavras comuns (erros frequentes do Whisper em português)
         corrections = [
             # Erro: "preciso a diário" → correto: "preciso adiar"
             (r'\bpreciso\s+a\s+diário\b', 'preciso adiar', re.IGNORECASE),
