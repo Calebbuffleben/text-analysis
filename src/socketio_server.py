@@ -202,14 +202,21 @@ _result_rate_limit = TTLCache(
 
 
 def _text_similar(a: str, b: str, threshold: float = 0.6) -> bool:
-    """Jaccard similarity on word sets — catches near-duplicate overlapping-window transcriptions."""
+    """Containment similarity — if most words of either text appear in the other, they're duplicates.
+    
+    More robust than Jaccard for overlapping-window transcriptions where one window captures
+    a subset of the other (e.g. "preciso pensar sobre isso" vs "pensar sobre").
+    """
     words_a = set(a.lower().split())
     words_b = set(b.lower().split())
     if not words_a or not words_b:
         return a == b
     intersection = words_a & words_b
-    union = words_a | words_b
-    return len(intersection) / len(union) >= threshold
+    containment = max(
+        len(intersection) / len(words_a),
+        len(intersection) / len(words_b),
+    )
+    return containment >= threshold
 
 
 async def on_buffer_ready(meeting_id: str, participant_id: str, track: str,
@@ -283,6 +290,18 @@ async def on_buffer_ready(meeting_id: str, participant_id: str, track: str,
             'total_processing_time_ms': t5_processing_complete - timestamp,
         }
         
+        dedupe_key = (meeting_id, participant_id)
+        cached_text = _result_dedupe_cache.get(dedupe_key)
+        if cached_text is not None and _text_similar(cached_text, text):
+            logger.debug(
+                "🧩 [DEDUPE] Near-duplicate result ignored (containment similarity)",
+                meeting_id=meeting_id,
+                participant_id=participant_id,
+            )
+            return
+
+        _result_dedupe_cache[dedupe_key] = text
+
         rate_key = (meeting_id, participant_id)
         if rate_key in _result_rate_limit:
             logger.debug(
@@ -292,17 +311,6 @@ async def on_buffer_ready(meeting_id: str, participant_id: str, track: str,
                 participant_id=participant_id,
             )
             return
-        
-        dedupe_key = (meeting_id, participant_id)
-        cached_text = _result_dedupe_cache.get(dedupe_key)
-        if cached_text is not None and _text_similar(cached_text, text):
-            logger.debug(
-                "🧩 [DEDUPE] Near-duplicate result ignored (Jaccard similarity)",
-                meeting_id=meeting_id,
-                participant_id=participant_id,
-            )
-            return
-        _result_dedupe_cache[dedupe_key] = text
         _result_rate_limit[rate_key] = True
 
         # Escolher um caminho: Redis (queue) OU Socket.IO (direct), não ambos
