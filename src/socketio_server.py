@@ -313,6 +313,18 @@ async def on_buffer_ready(meeting_id: str, participant_id: str, track: str,
             return
         _result_rate_limit[rate_key] = True
 
+        # Diagnóstico: log quando um resultado é enviado ao backend (permite correlacionar com feedback de indecisão)
+        analysis = result_dict.get('analysis') or {}
+        sales_cat = analysis.get('sales_category') or 'none'
+        logger.info(
+            "📤 [EMIT] text_analysis_result enviado ao backend (pode disparar feedback se detector atender)",
+            meeting_id=meeting_id,
+            participant_id=participant_id,
+            text_length=len(text),
+            sales_category=sales_cat,
+            sales_category_intensity=analysis.get('sales_category_intensity'),
+        )
+
         # Escolher um caminho: Redis (queue) OU Socket.IO (direct), não ambos
         if _deep_queue_enabled and _deep_redis_url:
             # Queue path: publish to Redis only
