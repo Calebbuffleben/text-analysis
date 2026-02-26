@@ -289,7 +289,8 @@ async def on_buffer_ready(meeting_id: str, participant_id: str, track: str,
             't5_processing_complete': t5_processing_complete,
             'total_processing_time_ms': t5_processing_complete - timestamp,
         }
-        
+        result_dict['source'] = 'buffer'
+
         dedupe_key = (meeting_id, participant_id)
         cached_text = _result_dedupe_cache.get(dedupe_key)
         if cached_text is not None and _text_similar(cached_text, text):
@@ -622,6 +623,17 @@ async def transcription_chunk(sid, data: Dict[str, Any]):
         # Enviar resultado de volta via Socket.IO
         # Pydantic v2.5.3 usa model_dump() ao invés de dict()
         result_dict = result.model_dump()
+        result_dict['source'] = 'egress'
+        analysis = result_dict.get('analysis') or {}
+        sales_cat = analysis.get('sales_category') or 'none'
+        logger.info(
+            "📤 [EMIT] text_analysis_result enviado ao backend (caminho transcription_chunk/egress)",
+            meeting_id=chunk.meetingId,
+            participant_id=chunk.participantId,
+            text_length=len(chunk.text),
+            sales_category=sales_cat,
+            sales_category_intensity=analysis.get('sales_category_intensity'),
+        )
         await sio.emit('text_analysis_result', result_dict, room=sid)
         
         logger.info(
