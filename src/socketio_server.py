@@ -22,6 +22,22 @@ from .services.audio_buffer_service import AudioBufferService
 
 logger = structlog.get_logger()
 
+
+def _make_json_serializable(obj: Any) -> Any:
+    """Convert numpy types (float32, ndarray, etc.) to native Python for JSON."""
+    if isinstance(obj, dict):
+        return {k: _make_json_serializable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_make_json_serializable(x) for x in obj]
+    # numpy scalar (float32, float64, int32, etc.)
+    if hasattr(obj, "item") and hasattr(obj, "dtype"):
+        return obj.item()
+    # numpy array
+    if hasattr(obj, "tolist"):
+        return obj.tolist()
+    return obj
+
+
 analysis_service: Optional[TextAnalysisService] = None
 transcription_service: Optional[TranscriptionService] = None
 
@@ -334,7 +350,7 @@ async def on_buffer_ready(meeting_id: str, participant_id: str, track: str,
                     # create a client lazily; group creation not required for producer
                     # decode_responses=True because we store JSON string
                     globals()['_deep_redis'] = redis.from_url(_deep_redis_url, decode_responses=True)
-                await _deep_redis.xadd(_deep_results_stream, {'json': json.dumps(result_dict)}, maxlen=20000, approximate=True)
+                await _deep_redis.xadd(_deep_results_stream, {'json': json.dumps(_make_json_serializable(result_dict))}, maxlen=20000, approximate=True)
                 
                 t6_result_enqueued = time.time() * 1000
                 
