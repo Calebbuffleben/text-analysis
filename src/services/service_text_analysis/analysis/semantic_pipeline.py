@@ -109,8 +109,9 @@ async def run(
     """
     Executa pipeline semântico (sentiment → sales_category → contexto → agregação).
     Retorna (base_dict, semantic_result) para o orquestrador fazer dispatch e merge.
+    Sentimento: neutro fixo (analyze_sentiment retorna sem modelo de sentimento).
     """
-    sentiment = analyzer.analyze_sentiment(chunk.text)
+    sentiment = analyzer.analyze_sentiment(chunk.text)  # neutro fixo: {positive:0, negative:0, neutral:1}
     keywords = analyzer.extract_keywords(chunk.text, top_n=10)
     emotions = analyzer.detect_emotions(chunk.text)
     if Config.SBERT_MODEL_NAME:

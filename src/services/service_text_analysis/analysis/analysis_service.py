@@ -57,7 +57,6 @@ class TextAnalysisService:
         self._executor = ThreadPoolExecutor(max_workers=1)
         
         # Evita race condition quando múltiplas análises simultâneas tentam carregar modelos
-        self._bert_loading = False
         self._sbert_loading = False
 
         # Inicializado como None e criado quando necessário (dentro de contexto async)
@@ -79,31 +78,27 @@ class TextAnalysisService:
     
     def _get_analyzer(self) -> BERTAnalyzer:
         """
-        Retorna analisador BERT (lazy loading).
+        Retorna analisador (lazy loading). Usa apenas SBERT para análise semântica.
         
         Returns:
             Instância de BERTAnalyzer
         """
         if self.analyzer is None:
-            logger.info("Initializing BERT analyzer")
+            logger.info("Initializing analyzer (SBERT)")
             self.analyzer = BERTAnalyzer(
-                model_name=Config.MODEL_NAME,
-                device=Config.MODEL_DEVICE,
-                cache_dir=Config.MODEL_CACHE_DIR,
-                max_length=Config.ANALYSIS_MAX_LENGTH,
                 sbert_model_name=getattr(Config, 'SBERT_MODEL_NAME', None)
             )
         return self.analyzer
     
     async def _ensure_models_loaded(self, require_sbert: bool = False):
         """
-        Garante que modelos BERT/SBERT estão carregados (lazy loading assíncrono).
+        Garante que o modelo SBERT está carregado (lazy loading assíncrono).
         
         Executa carregamento no executor para não bloquear event loop.
         Usa lock para evitar carregamento duplicado simultâneo.
         
         Args:
-            require_sbert: Se True, também carrega SBERT (necessário para análise semântica)
+            require_sbert: Se True, carrega SBERT (necessário para análise semântica)
         """
         # Inicializar lock se ainda não foi criado (caso não havia event loop no __init__)
         if self._model_loading_lock is None:
@@ -119,36 +114,6 @@ class TextAnalysisService:
             # Garantir que analyzer existe (instanciar se necessário)
             if self.analyzer is None:
                 self._get_analyzer()
-            
-            # Carregar BERT se necessário
-            if not self.analyzer._loaded:
-                if not self._bert_loading:
-                    self._bert_loading = True
-                    try:
-                        logger.info(
-                            "🔄 [ANÁLISE] Carregando modelo BERT em thread separada (não bloqueia event loop)",
-                            model=Config.MODEL_NAME
-                        )
-                        
-                        # Obter event loop para executar no executor
-                        try:
-                            loop = asyncio.get_running_loop()
-                        except RuntimeError:
-                            loop = asyncio.get_event_loop()
-                        
-                        # Carregar no executor (não bloqueia event loop)
-                        # Isso libera o event loop para processar outros eventos (ex: health_ping, conexões Socket.IO)
-                        await loop.run_in_executor(
-                            self._executor,
-                            self._load_bert_model_sync
-                        )
-                        
-                        logger.info(
-                            "✅ [ANÁLISE] Modelo BERT carregado com sucesso",
-                            model=Config.MODEL_NAME
-                        )
-                    finally:
-                        self._bert_loading = False
             
             # Carregar SBERT se necessário
             if require_sbert and not self.analyzer._sbert_loaded:
@@ -179,20 +144,6 @@ class TextAnalysisService:
                         )
                     finally:
                         self._sbert_loading = False
-    
-    def _load_bert_model_sync(self):
-        """
-        Carrega modelo BERT de forma síncrona (executar no executor).
-        
-        Este método é projetado para ser executado em ThreadPoolExecutor,
-        permitindo que o carregamento bloqueante (~25-35s) não bloqueie o event loop.
-        
-        NOTA: Não deve ser chamado diretamente - use _ensure_models_loaded().
-        """
-        if not self.analyzer:
-            self._get_analyzer()
-        if not self.analyzer._loaded:
-            self.analyzer._load_model()
     
     def _load_sbert_model_sync(self):
         """
@@ -260,7 +211,7 @@ class TextAnalysisService:
         """
         start_time = time.perf_counter()
         
-        await self._ensure_models_loaded(require_sbert=False)
+        await self._ensure_models_loaded(require_sbert=True)
         analyzer = self._get_analyzer()
         base, semantic_result = await run_semantic_pipeline(chunk, analyzer, self)
         context = {

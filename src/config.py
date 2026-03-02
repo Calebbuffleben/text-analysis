@@ -17,11 +17,6 @@ class _Settings(BaseSettings):
     # Socket.IO Configuration
     SOCKETIO_CORS_ORIGINS: str | List[str] | None = Field(default="*")
 
-    # ML Model Configuration
-    MODEL_NAME: str = "neuralmind/bert-base-portuguese-cased"
-    MODEL_CACHE_DIR: str = "/app/models/.cache"
-    MODEL_DEVICE: str = "cpu"
-
     # SBERT Configuration
     SBERT_MODEL_NAME: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 
@@ -30,7 +25,6 @@ class _Settings(BaseSettings):
     CACHE_MAX_SIZE: int = 1000
 
     # Performance Configuration
-    ANALYSIS_MAX_LENGTH: int = 512
     ANALYSIS_BATCH_SIZE: int = 1
 
     # Whisper Configuration
@@ -115,13 +109,9 @@ class Config:
     PUBLIC_HOSTNAME = _settings.PUBLIC_HOSTNAME
     LOG_LEVEL = _settings.LOG_LEVEL
     SOCKETIO_CORS_ORIGINS = _settings.SOCKETIO_CORS_ORIGINS
-    MODEL_NAME = _settings.MODEL_NAME
-    MODEL_CACHE_DIR = _settings.MODEL_CACHE_DIR
-    MODEL_DEVICE = _settings.MODEL_DEVICE
     SBERT_MODEL_NAME = _settings.SBERT_MODEL_NAME
     CACHE_TTL_SECONDS = _settings.CACHE_TTL_SECONDS
     CACHE_MAX_SIZE = _settings.CACHE_MAX_SIZE
-    ANALYSIS_MAX_LENGTH = _settings.ANALYSIS_MAX_LENGTH
     ANALYSIS_BATCH_SIZE = _settings.ANALYSIS_BATCH_SIZE
     WHISPER_MODEL_NAME = _settings.WHISPER_MODEL_NAME
     WHISPER_DEVICE = _settings.WHISPER_DEVICE
@@ -144,8 +134,6 @@ class Config:
             _Settings()
         except ValidationError as exc:
             raise AssertionError(f"Invalid configuration: {exc}") from exc
-        assert cls.MODEL_NAME, "MODEL_NAME must be set"
-        assert cls.MODEL_CACHE_DIR, "MODEL_CACHE_DIR must be set"
         assert cls.CACHE_TTL_SECONDS > 0, "CACHE_TTL_SECONDS must be positive"
         assert cls.CACHE_MAX_SIZE > 0, "CACHE_MAX_SIZE must be positive"
 

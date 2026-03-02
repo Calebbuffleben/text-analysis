@@ -284,7 +284,7 @@ async def on_buffer_ready(meeting_id: str, participant_id: str, track: str,
             confidence=confidence
         )
         
-        # Analisar texto com BERT
+        # Analisar texto (SBERT)
         analysis_result = await analysis_service.analyze(chunk)
         
         # Criar resposta
@@ -608,7 +608,7 @@ async def transcription_chunk(sid, data: Dict[str, Any]):
         )
         chunk = TranscriptionChunk(**data)
         
-        # Processar texto com BERT
+        # Processar texto (SBERT)
         logger.info(
             "⚙️ [FLUXO] Iniciando análise de texto",
             client_id=sid,
@@ -633,7 +633,7 @@ async def transcription_chunk(sid, data: Dict[str, Any]):
             text=chunk.text,
             analysis=analysis_result,
             timestamp=chunk.timestamp,
-            confidence=0.9  # Confiança baseada no modelo BERT
+            confidence=0.9  # Confiança baseada no modelo SBERT
         )
         
         # Enviar resultado de volta via Socket.IO
@@ -693,7 +693,7 @@ async def audio_chunk(sid, data: Dict[str, Any]):
     1. Recebe chunk de áudio WAV
     2. Adiciona ao buffer de áudio
     3. Quando buffer atinge duração mínima, transcreve com Whisper
-    4. Se houver texto transcrito, analisa com BERT
+    4. Se houver texto transcrito, analisa com SBERT
     5. Retorna resultado de análise
     
     Args:

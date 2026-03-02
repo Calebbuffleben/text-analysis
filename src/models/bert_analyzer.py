@@ -1,16 +1,11 @@
 """
-Analisador de texto usando modelo BERT pré-treinado em português.
-Implementa análise de sentimento, extração de keywords, detecção de emoções
-e análise semântica com SBERT (Sentence-BERT).
+Analisador de texto com SBERT (Sentence-BERT) para análise semântica.
+Implementa extração de keywords, detecção de emoções e análise semântica
+(sales_category, embeddings). Sentimento retorna neutro fixo (sem modelo de sentimento).
 """
 
 import torch
 import numpy as np
-from transformers import (
-    AutoTokenizer,
-    AutoModelForSequenceClassification,
-    pipeline
-)
 from sentence_transformers import SentenceTransformer
 from typing import Dict, List, Optional, Tuple, Any
 import structlog
@@ -303,11 +298,11 @@ except LookupError:
 
 class BERTAnalyzer:
     """
-    Analisador de texto usando BERT para português.
+    Analisador de texto com SBERT para análise semântica.
     
     Funcionalidades:
-    - Análise de sentimento (positivo/negativo/neutro)
-    - Extração de keywords
+    - Sentimento neutro fixo (sem modelo de sentimento; compatibilidade de API)
+    - Extração de keywords (NLTK)
     - Detecção básica de emoções
     - Análise semântica com SBERT (embeddings e similaridade)
     - Classificação de categorias de vendas usando SBERT (price_interest, value_exploration,
@@ -320,35 +315,15 @@ class BERTAnalyzer:
     de performance.
     """
     
-    def __init__(
-        self,
-        model_name: str,
-        device: str = "cpu",
-        cache_dir: str = None,
-        max_length: int = 512,
-        sbert_model_name: Optional[str] = None
-    ):
+    def __init__(self, sbert_model_name: Optional[str] = None):
         """
-        Inicializa analisador BERT.
+        Inicializa analisador com SBERT para análise semântica.
         
         Args:
-            model_name: Nome do modelo BERT no Hugging Face Hub
-            device: Dispositivo ('cpu' ou 'cuda')
-            cache_dir: Diretório para cache de modelos
-            max_length: Tamanho máximo de tokens
             sbert_model_name: Nome do modelo SBERT (opcional, para análise semântica)
         """
-        self.model_name = model_name
-        self.device = device
-        self.cache_dir = cache_dir
-        self.max_length = max_length
         self.sbert_model_name = sbert_model_name
-        
-        # Modelos BERT para análise de sentimento
-        self.tokenizer = None
-        self.model = None
-        self.pipeline = None
-        self._loaded = False
+        self.device = "cpu"
         
         # Modelo SBERT para análise semântica (lazy loading)
         # SBERT é uma arquitetura especializada em gerar embeddings semânticos
@@ -414,123 +389,22 @@ class BERTAnalyzer:
         
         logger.info(
             "BERTAnalyzer initialized",
-            model=model_name,
-            device=device,
-            cache_dir=cache_dir
+            sbert_model=self.sbert_model_name,
         )
-    
-    def _load_model(self):
-        """Carrega modelo BERT (lazy loading)"""
-        if self._loaded:
-            return
-        
-        logger.info("Loading BERT model", model=self.model_name)
-        
-        try:
-            # Carregar tokenizer
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                self.model_name,
-                cache_dir=self.cache_dir
-            )
-            
-            # Carregar modelo
-            self.model = AutoModelForSequenceClassification.from_pretrained(
-                self.model_name,
-                cache_dir=self.cache_dir
-            )
-            
-            # Mover para dispositivo
-            if self.device == "cuda" and torch.cuda.is_available():
-                self.model = self.model.to("cuda")
-                self.device = "cuda"
-                logger.info("Using CUDA device")
-            else:
-                self.device = "cpu"
-                logger.info("Using CPU device")
-            
-            # Modo de avaliação (não treinamento)
-            self.model.eval()
-            
-            # Criar pipeline para análise de sentimento
-            self.pipeline = pipeline(
-                "sentiment-analysis",
-                model=self.model,
-                tokenizer=self.tokenizer,
-                device=0 if self.device == "cuda" else -1,
-                return_all_scores=False
-            )
-            
-            self._loaded = True
-            logger.info("BERT model loaded successfully", device=self.device)
-            
-        except Exception as e:
-            logger.error("Failed to load BERT model", error=str(e))
-            raise
-    
+
     def analyze_sentiment(self, text: str) -> Dict[str, float]:
         """
-        Analisa sentimento do texto usando BERT.
+        Retorna sentimento neutro fixo (sem modelo de sentimento carregado).
+        Mantido para compatibilidade do pipeline; não usa BERT.
         
         Args:
-            text: Texto a ser analisado
+            text: Texto (ignorado)
             
         Returns:
-            Dict com scores de sentimento:
-            {
-                'positive': float,
-                'negative': float,
-                'neutral': float
-            }
+            Dict com scores de sentimento: positive=0, negative=0, neutral=1
         """
-        if not self._loaded:
-            self._load_model()
-        
-        try:
-            # Truncar texto se muito longo
-            if len(text) > self.max_length * 4:  # Aproximação: 4 chars por token
-                text = text[:self.max_length * 4]
-                logger.debug("Text truncated", original_length=len(text))
-            
-            # Análise com pipeline
-            result = self.pipeline(text)[0]
-            
-            # Extrair label e score
-            label = result['label'].lower()
-            score = result['score']
-            
-            # Normalizar para formato esperado
-            sentiment = {
-                'positive': 0.0,
-                'negative': 0.0,
-                'neutral': 0.0
-            }
-            
-            # Mapear labels do modelo para nosso formato
-            if 'pos' in label or 'positive' in label or 'positivo' in label:
-                sentiment['positive'] = score
-                sentiment['neutral'] = 1.0 - score
-            elif 'neg' in label or 'negative' in label or 'negativo' in label:
-                sentiment['negative'] = score
-                sentiment['neutral'] = 1.0 - score
-            else:
-                # Label neutro ou desconhecido
-                sentiment['neutral'] = score
-                sentiment['positive'] = (1.0 - score) / 2
-                sentiment['negative'] = (1.0 - score) / 2
-            
-            logger.debug(
-                "Sentiment analysis completed",
-                sentiment=sentiment,
-                label=label
-            )
-            
-            return sentiment
-            
-        except Exception as e:
-            logger.error("Sentiment analysis failed", error=str(e), text_preview=text[:50])
-            # Retornar sentimento neutro em caso de erro
-            return {'positive': 0.0, 'negative': 0.0, 'neutral': 1.0}
-    
+        return {"positive": 0.0, "negative": 0.0, "neutral": 1.0}
+
     def extract_keywords(self, text: str, top_n: int = 10) -> List[str]:
         """
         Extrai palavras-chave do texto usando NLTK.

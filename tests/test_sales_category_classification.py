@@ -36,8 +36,6 @@ class TestSalesCategoryClassification:
         durante os testes (mais rápido e não requer GPU).
         """
         analyzer = BERTAnalyzer(
-            model_name='neuralmind/bert-base-portuguese-cased',
-            device='cpu',
             sbert_model_name='sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2'
         )
         
@@ -63,11 +61,7 @@ class TestSalesCategoryClassification:
         
         Útil para testar comportamento quando SBERT não está disponível.
         """
-        return BERTAnalyzer(
-            model_name='neuralmind/bert-base-portuguese-cased',
-            device='cpu',
-            sbert_model_name=None
-        )
+        return BERTAnalyzer(sbert_model_name=None)
     
     def test_load_sales_category_examples_embeddings(self, analyzer_with_sbert):
         """

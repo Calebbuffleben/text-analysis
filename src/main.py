@@ -118,7 +118,7 @@ async def lifespan(app: FastAPI):
 # Criar app FastAPI com lifespan
 fastapi_app = FastAPI(
     title="Text Analysis Service",
-    description="Serviço de análise de texto com BERT para português",
+    description="Serviço de análise de texto com SBERT para português",
     version="1.0.0",
     lifespan=lifespan
 )
@@ -307,10 +307,8 @@ if __name__ == "__main__":
         host=Config.PUBLIC_HOSTNAME,  # Use public hostname for logs
         bind_host=Config.HOST,  # Show bind host (0.0.0.0) separately
         port=Config.PORT,
-        model=Config.MODEL_NAME,
         sbert_model=Config.SBERT_MODEL_NAME,
         whisper_model=Config.WHISPER_MODEL_NAME,
-        device=Config.MODEL_DEVICE,
         cache_ttl=Config.CACHE_TTL_SECONDS,
         cache_max_size=Config.CACHE_MAX_SIZE
     )

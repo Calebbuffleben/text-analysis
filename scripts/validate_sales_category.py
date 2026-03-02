@@ -34,7 +34,6 @@ def validate_sales_category(text: str):
     print(f"\nTexto: '{text}'")
     print(f"\nConfiguração:")
     print(f"  - SBERT Model: {Config.SBERT_MODEL_NAME}")
-    print(f"  - Device: {Config.MODEL_DEVICE}")
     
     if not Config.SBERT_MODEL_NAME:
         print("\n⚠️  AVISO: SBERT_MODEL_NAME não está configurado!")
@@ -44,14 +43,8 @@ def validate_sales_category(text: str):
     
     try:
         # Criar analisador
-        print("\n📦 Inicializando BERTAnalyzer...")
-        analyzer = BERTAnalyzer(
-            model_name=Config.MODEL_NAME,
-            device=Config.MODEL_DEVICE,
-            cache_dir=Config.MODEL_CACHE_DIR,
-            max_length=Config.ANALYSIS_MAX_LENGTH,
-            sbert_model_name=Config.SBERT_MODEL_NAME
-        )
+        print("\n📦 Inicializando BERTAnalyzer (SBERT)...")
+        analyzer = BERTAnalyzer(sbert_model_name=Config.SBERT_MODEL_NAME)
         
         # Classificar texto
         print("🔍 Classificando texto...")
