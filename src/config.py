@@ -49,9 +49,13 @@ class _Settings(BaseSettings):
     CONTINUOUS_HOP_SEC: float = 1.0
     CONTINUOUS_TICK_SEC: float = 1.0
 
-    # Dedupe configuration
-    RESULT_DEDUPE_TTL_SEC: float = 6.0
+    # Dedupe configuration — TTL must cover the full circular buffer lifetime
+    # so the same speech is never re-emitted while still in the buffer.
+    RESULT_DEDUPE_TTL_SEC: float = 30.0
     RESULT_DEDUPE_MAX_SIZE: int = 20000
+
+    # Rate limiter: minimum interval between result emissions per participant
+    RESULT_MIN_INTERVAL_SEC: float = 5.0
 
     @field_validator("SOCKETIO_CORS_ORIGINS", mode="before")
     @classmethod
@@ -131,6 +135,7 @@ class Config:
     CONTINUOUS_TICK_SEC = _settings.CONTINUOUS_TICK_SEC
     RESULT_DEDUPE_TTL_SEC = _settings.RESULT_DEDUPE_TTL_SEC
     RESULT_DEDUPE_MAX_SIZE = _settings.RESULT_DEDUPE_MAX_SIZE
+    RESULT_MIN_INTERVAL_SEC = _settings.RESULT_MIN_INTERVAL_SEC
 
     @classmethod
     def validate(cls):

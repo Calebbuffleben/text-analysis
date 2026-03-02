@@ -22,6 +22,22 @@ from .services.audio_buffer_service import AudioBufferService
 
 logger = structlog.get_logger()
 
+
+def _make_json_serializable(obj: Any) -> Any:
+    """Convert numpy types (float32, ndarray, etc.) to native Python for JSON."""
+    if isinstance(obj, dict):
+        return {k: _make_json_serializable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_make_json_serializable(x) for x in obj]
+    # numpy scalar (float32, float64, int32, etc.)
+    if hasattr(obj, "item") and hasattr(obj, "dtype"):
+        return obj.item()
+    # numpy array
+    if hasattr(obj, "tolist"):
+        return obj.tolist()
+    return obj
+
+
 analysis_service: Optional[TextAnalysisService] = None
 transcription_service: Optional[TranscriptionService] = None
 
@@ -195,6 +211,29 @@ _result_dedupe_cache = TTLCache(
     ttl=Config.RESULT_DEDUPE_TTL_SEC,
 )
 
+_result_rate_limit = TTLCache(
+    maxsize=Config.RESULT_DEDUPE_MAX_SIZE,
+    ttl=Config.RESULT_MIN_INTERVAL_SEC,
+)
+
+
+def _text_similar(a: str, b: str, threshold: float = 0.6) -> bool:
+    """Containment similarity — if most words of either text appear in the other, they're duplicates.
+    
+    More robust than Jaccard for overlapping-window transcriptions where one window captures
+    a subset of the other (e.g. "preciso pensar sobre isso" vs "pensar sobre").
+    """
+    words_a = set(a.lower().split())
+    words_b = set(b.lower().split())
+    if not words_a or not words_b:
+        return a == b
+    intersection = words_a & words_b
+    containment = max(
+        len(intersection) / len(words_a),
+        len(intersection) / len(words_b),
+    )
+    return containment >= threshold
+
 
 async def on_buffer_ready(meeting_id: str, participant_id: str, track: str,
                          wav_data: bytes, sample_rate: int, channels: int, timestamp: int,
@@ -269,17 +308,42 @@ async def on_buffer_ready(meeting_id: str, participant_id: str, track: str,
             't5_processing_complete': t5_processing_complete,
             'total_processing_time_ms': t5_processing_complete - timestamp,
         }
-        
+        result_dict['source'] = 'buffer'
+
         dedupe_key = (meeting_id, participant_id)
-        fingerprint = text
-        if _result_dedupe_cache.get(dedupe_key) == fingerprint:
+        cached_text = _result_dedupe_cache.get(dedupe_key)
+        if cached_text is not None and _text_similar(cached_text, text):
             logger.debug(
-                "🧩 [DEDUPE] Resultado duplicado ignorado",
+                "🧩 [DEDUPE] Near-duplicate result ignored (containment similarity)",
                 meeting_id=meeting_id,
                 participant_id=participant_id,
             )
             return
-        _result_dedupe_cache[dedupe_key] = fingerprint
+
+        _result_dedupe_cache[dedupe_key] = text
+
+        rate_key = (meeting_id, participant_id)
+        if rate_key in _result_rate_limit:
+            logger.debug(
+                "⏱️ [RATE_LIMIT] Result rate-limited (one per %.1fs per participant)",
+                Config.RESULT_MIN_INTERVAL_SEC,
+                meeting_id=meeting_id,
+                participant_id=participant_id,
+            )
+            return
+        _result_rate_limit[rate_key] = True
+
+        # Diagnóstico: log quando um resultado é enviado ao backend (permite correlacionar com feedback de indecisão)
+        analysis = result_dict.get('analysis') or {}
+        sales_cat = analysis.get('sales_category') or 'none'
+        logger.info(
+            "📤 [EMIT] text_analysis_result enviado ao backend (pode disparar feedback se detector atender)",
+            meeting_id=meeting_id,
+            participant_id=participant_id,
+            text_length=len(text),
+            sales_category=sales_cat,
+            sales_category_intensity=analysis.get('sales_category_intensity'),
+        )
 
         # Escolher um caminho: Redis (queue) OU Socket.IO (direct), não ambos
         if _deep_queue_enabled and _deep_redis_url:
@@ -289,7 +353,7 @@ async def on_buffer_ready(meeting_id: str, participant_id: str, track: str,
                     # create a client lazily; group creation not required for producer
                     # decode_responses=True because we store JSON string
                     globals()['_deep_redis'] = redis.from_url(_deep_redis_url, decode_responses=True)
-                await _deep_redis.xadd(_deep_results_stream, {'json': json.dumps(result_dict)}, maxlen=20000, approximate=True)
+                await _deep_redis.xadd(_deep_results_stream, {'json': json.dumps(_make_json_serializable(result_dict))}, maxlen=20000, approximate=True)
                 
                 t6_result_enqueued = time.time() * 1000
                 
@@ -581,6 +645,17 @@ async def transcription_chunk(sid, data: Dict[str, Any]):
         # Enviar resultado de volta via Socket.IO
         # Pydantic v2.5.3 usa model_dump() ao invés de dict()
         result_dict = result.model_dump()
+        result_dict['source'] = 'egress'
+        analysis = result_dict.get('analysis') or {}
+        sales_cat = analysis.get('sales_category') or 'none'
+        logger.info(
+            "📤 [EMIT] text_analysis_result enviado ao backend (caminho transcription_chunk/egress)",
+            meeting_id=chunk.meetingId,
+            participant_id=chunk.participantId,
+            text_length=len(chunk.text),
+            sales_category=sales_cat,
+            sales_category_intensity=analysis.get('sales_category_intensity'),
+        )
         await sio.emit('text_analysis_result', result_dict, room=sid)
         
         logger.info(
