@@ -7,6 +7,7 @@ de erros seguro.
 """
 
 from typing import Dict, Any, List, Optional
+
 from ..models.bert_analyzer import BERTAnalyzer
 import structlog
 
@@ -54,10 +55,18 @@ def compute_indecision_metrics_safe(
                 sales_category_ambiguity or 0.0,
                 conditional_keywords_detected
             )
+        # Quando sales_category é None, o backend não recebe métricas e a regra de
+        # linguagem condicional nunca dispara. Incluir ao menos conditional_language_score
+        # quando houver keywords condicionais para a regra 1 poder disparar.
+        if conditional_keywords_detected and "conditional_language_score" not in indecision_metrics:
+            cond_score = min(1.0, len(conditional_keywords_detected) / 5.0)
+            indecision_metrics["conditional_language_score"] = cond_score
+            if "indecision_score" not in indecision_metrics:
+                indecision_metrics["indecision_score"] = cond_score * 0.5
     except Exception as e:
         # Não bloquear análise se cálculo de métricas falhar
         # Retorna {} (dict vazio) para indicar que não foi possível calcular
         pass
-    
+
     return indecision_metrics
 
