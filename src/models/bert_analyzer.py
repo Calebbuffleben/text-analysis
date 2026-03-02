@@ -324,7 +324,8 @@ class BERTAnalyzer:
         """
         self.sbert_model_name = sbert_model_name
         self.device = "cpu"
-        
+        self.cache_dir = None  # usado por SentenceTransformer (cache_folder); None = diretório padrão
+
         # Modelo SBERT para análise semântica (lazy loading)
         # SBERT é uma arquitetura especializada em gerar embeddings semânticos
         # de sentenças completas, otimizada para tarefas de similaridade semântica
