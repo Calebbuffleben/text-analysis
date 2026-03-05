@@ -38,6 +38,57 @@ def _make_json_serializable(obj: Any) -> Any:
     return obj
 
 
+def _ensure_embedding_list(emb: Any) -> list:
+    """
+    Garante que embedding seja sempre uma lista de floats antes de serializar.
+    Evita que falha de serialização (ex.: numpy scalar ou valor único) chegue ao backend
+    como número (0.7 ou 0) e impeça o feedback solution_understood.
+    """
+    if emb is None:
+        return []
+    if isinstance(emb, (int, float)):
+        logger.error(
+            "embedding_serialization_wrong_shape",
+            message="Embedding is scalar (number); backend expects list of floats. Solution_understood will not fire.",
+            value=emb,
+            hint="Check semantic_pipeline: embedding must be list of floats from generate_semantic_embedding.",
+        )
+        return []
+    if hasattr(emb, "ravel") and hasattr(emb, "tolist"):
+        try:
+            flat = emb.ravel()
+            return [float(x) for x in flat.tolist()]
+        except Exception as e:
+            logger.error(
+                "embedding_serialization_failed",
+                error=str(e),
+                error_type=type(e).__name__,
+            )
+            return []
+    if isinstance(emb, (list, tuple)):
+        try:
+            out = []
+            for x in emb:
+                if hasattr(x, "item") and hasattr(x, "dtype"):
+                    out.append(float(x.item()))
+                else:
+                    out.append(float(x))
+            return out
+        except (TypeError, ValueError) as e:
+            logger.error(
+                "embedding_serialization_list_failed",
+                error=str(e),
+                error_type=type(e).__name__,
+                list_length=len(emb),
+            )
+            return []
+    logger.warn(
+        "embedding_serialization_unknown_type",
+        type_=type(emb).__name__,
+    )
+    return []
+
+
 analysis_service: Optional[TextAnalysisService] = None
 transcription_service: Optional[TranscriptionService] = None
 
@@ -307,6 +358,12 @@ async def on_buffer_ready(meeting_id: str, participant_id: str, track: str,
         }
         result_dict['source'] = 'buffer'
 
+        # Garantir embedding como lista de floats (evita serialização como escalar e falha do feedback)
+        if result_dict.get('analysis') is not None:
+            result_dict['analysis']['embedding'] = _ensure_embedding_list(
+                result_dict['analysis'].get('embedding')
+            )
+
         dedupe_key = (meeting_id, participant_id)
         cached_text = _result_dedupe_cache.get(dedupe_key)
         if cached_text is not None and _text_similar(cached_text, text):
@@ -352,8 +409,9 @@ async def on_buffer_ready(meeting_id: str, participant_id: str, track: str,
         )
 
         # Escolher um caminho: Redis (queue) OU Socket.IO (direct), não ambos
+        # result_dict já tem analysis.embedding normalizado por _ensure_embedding_list acima
         if _deep_queue_enabled and _deep_redis_url:
-            # Queue path: publish to Redis only
+            # Queue path: publish to Redis only (embedding já é lista de floats)
             try:
                 if _deep_redis is None:
                     # create a client lazily; group creation not required for producer
@@ -650,6 +708,10 @@ async def transcription_chunk(sid, data: Dict[str, Any]):
         result_dict = result.model_dump()
         result_dict['source'] = 'egress'
         analysis = result_dict.get('analysis') or {}
+        # Garantir embedding como lista de floats (evita serialização como escalar e falha do feedback)
+        result_dict.setdefault('analysis', {})['embedding'] = _ensure_embedding_list(
+            analysis.get('embedding')
+        )
         sales_cat = analysis.get('sales_category') or 'none'
         logger.info(
             "📤 [EMIT] text_analysis_result enviado ao backend (caminho transcription_chunk/egress)",
