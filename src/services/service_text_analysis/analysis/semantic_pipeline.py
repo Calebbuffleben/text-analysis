@@ -142,27 +142,44 @@ async def run(
         except Exception as e:
             logger.warn("conditional_keywords_failed", error=str(e), meeting_id=chunk.meetingId)
     embedding: List[float] = []
-    if Config.SBERT_MODEL_NAME:
-        try:
-            await svc._ensure_models_loaded(require_sbert=True)
+    text_for_embedding = (chunk.text or "").strip()
+    if Config.SBERT_MODEL_NAME and text_for_embedding:
+        def _do_embedding() -> List[float]:
             arr = analyzer.generate_semantic_embedding(chunk.text)
-            if arr is not None and len(arr) > 0:
-                # SBERT encode() pode retornar (dim,) ou (1, dim); achatar garante lista de floats
-                flat = arr.ravel() if hasattr(arr, "ravel") else arr
-                embedding = [float(x) for x in flat]
-            else:
+            if arr is None or len(arr) == 0:
+                return []
+            flat = arr.ravel() if hasattr(arr, "ravel") else arr
+            return [float(x) for x in flat]
+
+        for attempt in range(2):
+            try:
+                await svc._ensure_models_loaded(require_sbert=True)
+                embedding = _do_embedding()
+                if embedding:
+                    break
                 logger.warn(
                     "embedding_empty",
                     message="generate_semantic_embedding returned empty or None",
                     meeting_id=chunk.meetingId,
                     text_len=len(chunk.text),
+                    attempt=attempt + 1,
                 )
-        except Exception as e:
+            except Exception as e:
+                logger.error(
+                    "embedding_failed",
+                    error=str(e),
+                    error_type=type(e).__name__,
+                    meeting_id=chunk.meetingId,
+                    text_len=len(chunk.text),
+                    attempt=attempt + 1,
+                )
+
+        if not embedding and Config.SBERT_MODEL_NAME and text_for_embedding:
             logger.error(
-                "embedding_failed",
-                error=str(e),
-                error_type=type(e).__name__,
+                "embedding_missing",
+                message="Embedding empty after retries; solution_understood feedback will not fire for this segment",
                 meeting_id=chunk.meetingId,
+                participant_id=chunk.participantId,
                 text_len=len(chunk.text),
             )
     sales_category = None

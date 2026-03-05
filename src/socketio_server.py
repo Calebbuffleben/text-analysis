@@ -333,6 +333,15 @@ async def on_buffer_ready(meeting_id: str, participant_id: str, track: str,
         # Diagnóstico: log quando um resultado é enviado ao backend (permite correlacionar com feedback de indecisão)
         analysis = result_dict.get('analysis') or {}
         sales_cat = analysis.get('sales_category') or 'none'
+        emb = analysis.get('embedding')
+        if (text or '').strip() and (emb is None or (isinstance(emb, (list, tuple)) and len(emb) == 0)):
+            logger.error(
+                "embedding_empty_on_send",
+                message="Result has empty embedding; solution_understood feedback will not fire for this segment",
+                meeting_id=meeting_id,
+                participant_id=participant_id,
+                text_length=len(text),
+            )
         logger.info(
             "📤 [EMIT] text_analysis_result enviado ao backend (pode disparar feedback se detector atender)",
             meeting_id=meeting_id,
