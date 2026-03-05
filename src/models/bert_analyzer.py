@@ -331,6 +331,8 @@ class BERTAnalyzer:
         # de sentenças completas, otimizada para tarefas de similaridade semântica
         self.sbert_model: Optional[SentenceTransformer] = None
         self._sbert_loaded = False
+        # Limite de tokens para truncamento (atualizado ao carregar o modelo; padrão BERT/SBERT)
+        self.max_length = 512
         
         # ========================================================================
         # CACHE DE EMBEDDINGS PARA CLASSIFICAÇÃO DE CATEGORIAS DE VENDAS
@@ -555,6 +557,7 @@ class BERTAnalyzer:
                 logger.info("SBERT model loaded on CPU")
             
             self._sbert_loaded = True
+            self.max_length = getattr(self.sbert_model, "max_seq_length", 512)
             
             # Log da dimensão do embedding para referência
             # Isso ajuda a entender o tamanho dos vetores gerados
