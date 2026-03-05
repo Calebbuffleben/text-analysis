@@ -337,7 +337,7 @@ class BERTAnalyzer:
         # ========================================================================
         # 
         # Estrutura de dados para armazenar embeddings pré-calculados dos exemplos
-        # de referência de cada categoria de vendas.
+        # de referência de cada categoria de vendas.'
         #
         # Por que cachear embeddings?
         # ----------------------------

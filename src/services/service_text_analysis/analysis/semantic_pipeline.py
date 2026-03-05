@@ -144,10 +144,25 @@ async def run(
     embedding: List[float] = []
     if Config.SBERT_MODEL_NAME:
         try:
+            await svc._ensure_models_loaded(require_sbert=True)
             arr = analyzer.generate_semantic_embedding(chunk.text)
-            embedding = list(arr) if arr is not None else []
+            if arr is not None and len(arr) > 0:
+                embedding = [float(x) for x in arr]
+            else:
+                logger.warn(
+                    "embedding_empty",
+                    message="generate_semantic_embedding returned empty or None",
+                    meeting_id=chunk.meetingId,
+                    text_len=len(chunk.text),
+                )
         except Exception as e:
-            logger.warn("embedding_failed", error=str(e), meeting_id=chunk.meetingId)
+            logger.error(
+                "embedding_failed",
+                error=str(e),
+                error_type=type(e).__name__,
+                meeting_id=chunk.meetingId,
+                text_len=len(chunk.text),
+            )
     sales_category = None
     sales_category_confidence = None
     sales_category_ambiguity = None
