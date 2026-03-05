@@ -147,7 +147,9 @@ async def run(
             await svc._ensure_models_loaded(require_sbert=True)
             arr = analyzer.generate_semantic_embedding(chunk.text)
             if arr is not None and len(arr) > 0:
-                embedding = [float(x) for x in arr]
+                # SBERT encode() pode retornar (dim,) ou (1, dim); achatar garante lista de floats
+                flat = arr.ravel() if hasattr(arr, "ravel") else arr
+                embedding = [float(x) for x in flat]
             else:
                 logger.warn(
                     "embedding_empty",
